@@ -80,6 +80,18 @@ export class TelegramAirificaClient {
     private readonly alertPollMs: number;
     private readonly publicAppUrl: string;
     private readonly botUsername: string;
+    private readonly proposalDrafts = new Map<string, {
+        chatId: string;
+        proposalId: number;
+        messageId: number;
+        availableUsd: number;
+        maxLeverage: number;
+        leverage: number;
+        collateralPct: number | null;
+        collateralUsd: number | null;
+        proposal: any;
+    }>();
+    private readonly pendingCollateralInputs = new Map<string, { proposalId: number }>();
 
     constructor(runtime: IAgentRuntime) {
         this.runtime = runtime;
@@ -163,7 +175,7 @@ export class TelegramAirificaClient {
                 inline_keyboard: options.inlineKeyboard,
             };
         }
-        await this.telegramApi("sendMessage", payload);
+        return await this.telegramApi<any>("sendMessage", payload);
     }
 
     private async sendPhoto(chatId: string, image: string) {
@@ -245,27 +257,41 @@ export class TelegramAirificaClient {
         return `https://jup.ag/swap/SOL-${resolvedMint}`;
     }
 
-    private buildPacificaTradeKeyboard(proposalId: number, marginPct: number, leverage: number, maxLeverage: number) {
+    private getDraftKey(chatId: string, proposalId: number) {
+        return `${chatId}:${proposalId}`;
+    }
+
+    private buildPacificaTradeKeyboard(draft: {
+        proposalId: number;
+        marginPct: number | null;
+        leverage: number;
+        maxLeverage: number;
+    }) {
         const leverageOptions = Array.from(new Set(
-            [1, 2, 5, 10, 20, 50, Math.max(1, Math.trunc(maxLeverage || 1))]
-                .filter((value) => Number.isFinite(value) && value >= 1 && value <= Math.max(1, Math.trunc(maxLeverage || 1))),
+            [1, 2, 5, 10, 20, 50, Math.max(1, Math.trunc(draft.maxLeverage || 1))]
+                .filter((value) => Number.isFinite(value) && value >= 1 && value <= Math.max(1, Math.trunc(draft.maxLeverage || 1))),
         )).sort((left, right) => left - right).slice(0, 4);
 
         const leverageButtons = leverageOptions.map((value) => ({
-            text: value === leverage ? `[${value}x]` : `${value}x`,
-            callback_data: `tgp:l:${proposalId}:${value}:${marginPct}`,
+            text: value === draft.leverage ? `[${value}x]` : `${value}x`,
+            callback_data: `tgp:l:${draft.proposalId}:${value}`,
         }));
-        const collateralButtons = [10, 20, 30].map((value) => ({
-            text: value === marginPct ? `[${value}%]` : `${value}%`,
-            callback_data: `tgp:p:${proposalId}:${value}:${leverage}`,
+        const collateralButtons = [10, 20, 30, 100].map((value) => ({
+            text: value === 100
+                ? (draft.marginPct === 100 ? "[MAX]" : "MAX")
+                : (draft.marginPct === value ? `[${value}%]` : `${value}%`),
+            callback_data: `tgp:p:${draft.proposalId}:${value}`,
         }));
 
         return [
             leverageButtons,
             collateralButtons,
             [
-                { text: "Execute trade", callback_data: `tgp:x:${proposalId}:${marginPct}:${leverage}` },
-                ...(this.getConnectWebUrl() ? [{ text: "Open Airifica", url: this.getConnectWebUrl() }] : []),
+                { text: "Set size USD", callback_data: `tgp:s:${draft.proposalId}` },
+                { text: "Execute trade", callback_data: `tgp:x:${draft.proposalId}` },
+            ],
+            [
+                { text: "Refresh", callback_data: `tgp:r:${draft.proposalId}` },
             ],
         ];
     }
@@ -280,21 +306,29 @@ export class TelegramAirificaClient {
         tp: number;
         sl: number;
         availableUsd: number;
-        marginPct: number;
+        marginPct: number | null;
+        marginUsd?: number | null;
         leverage: number;
         maxLeverage: number;
     }) {
-        const marginUsd = Math.max(0, input.availableUsd * (input.marginPct / 100));
+        const marginUsd = Math.max(0, Number.isFinite(Number(input.marginUsd))
+            ? Number(input.marginUsd)
+            : input.marginPct != null
+                ? input.availableUsd * (input.marginPct / 100)
+                : 0);
         const notionalUsd = marginUsd * input.leverage;
         const quantity = input.entry > 0 ? notionalUsd / input.entry : 0;
         const rrText = Number.isFinite(input.rr) && input.rr && input.rr > 0 ? `R/R ${formatNumberCompact(input.rr, 2)}` : "R/R -";
+        const collateralLabel = input.marginPct != null
+            ? `Collateral: ${formatUsdCompact(marginUsd)} USD (${input.marginPct}% of available ${formatUsdCompact(input.availableUsd)} USD)`
+            : `Collateral: ${formatUsdCompact(marginUsd)} USD (custom size, available ${formatUsdCompact(input.availableUsd)} USD)`;
         return compact([
             `$${input.symbol} ${input.timeframe} | ${input.side} | ${rrText} | Confidence ${input.confidencePct}%`,
             `Entry: ${formatNumberCompact(input.entry, 6)}`,
             `TP: ${formatNumberCompact(input.tp, 6)}`,
             `SL: ${formatNumberCompact(input.sl, 6)}`,
             "",
-            `Collateral: ${formatUsdCompact(marginUsd)} USD (${input.marginPct}% of available ${formatUsdCompact(input.availableUsd)} USD)`,
+            collateralLabel,
             `Leverage: ${input.leverage}x / ${Math.max(1, input.maxLeverage)}x max`,
             `Quantity: ${formatNumberCompact(quantity, 6)} ${input.symbol}`,
             `Position size: ${formatUsdCompact(notionalUsd)} USD`,
@@ -444,8 +478,8 @@ export class TelegramAirificaClient {
 
         const keyboard = positions.slice(0, 6).map((position: any) => ([
             {
-                text: `Close ${position.symbol} ${position.side}`,
-                callback_data: `close:${position.symbol}:${position.side}`,
+                text: `${position.symbol} ${position.side}`,
+                callback_data: `pos:${position.symbol}:${position.side}`,
             },
         ]));
 
@@ -457,6 +491,73 @@ export class TelegramAirificaClient {
                     { text: "Home", callback_data: "nav:home" },
                 ],
             ],
+        });
+    }
+
+    private async renderPositionDetail(chatId: string, symbol: string, side: string, messageId?: number) {
+        const payload = await this.internalApi<any>("/api/airi3/telegram/internal/positions", {
+            method: "POST",
+            body: JSON.stringify({ chatId }),
+        });
+        const overview = payload.overview || {};
+        const account = overview.account || {};
+        const positions = Array.isArray(overview.positions) ? overview.positions : [];
+        const target = positions.find((position: any) => String(position.symbol) === symbol && String(position.side) === side);
+        if (!target) {
+            if (messageId && Number.isFinite(messageId) && messageId > 0) {
+                await this.editMessageText(chatId, messageId, "Position no longer open.", {
+                    inlineKeyboard: [[
+                        { text: "Positions", callback_data: "nav:positions" },
+                        { text: "Home", callback_data: "nav:home" },
+                    ]],
+                });
+                return;
+            }
+            await this.sendMessage(chatId, "Position no longer open.", {
+                inlineKeyboard: [[
+                    { text: "Positions", callback_data: "nav:positions" },
+                    { text: "Home", callback_data: "nav:home" },
+                ]],
+            });
+            return;
+        }
+
+        const text = compact([
+            `${target.symbol} ${target.side}`,
+            `Amount: ${formatNumberCompact(Number(target.amount || 0), 6)}`,
+            `Entry: ${formatNumberCompact(Number(target.entryPrice || 0), 6)}`,
+            `Mark: ${formatNumberCompact(Number(target.markPrice || 0), 6)}`,
+            `PnL: ${Number(target.unrealizedPnlUsd || 0) >= 0 ? "+" : ""}${formatUsdCompact(Number(target.unrealizedPnlUsd || 0))} USD (${formatNumberCompact(Number(target.unrealizedPnlPct || 0), 2)}%)`,
+            `Notional: ${formatUsdCompact(Number(target.notionalUsd || 0))} USD`,
+            `Margin: ${formatUsdCompact(Number(target.margin || 0))} USD`,
+            target.takeProfitPrice ? `TP: ${formatNumberCompact(Number(target.takeProfitPrice || 0), 6)}` : null,
+            target.stopLossPrice ? `SL: ${formatNumberCompact(Number(target.stopLossPrice || 0), 6)}` : null,
+            target.liquidationPrice ? `Liq: ${formatNumberCompact(Number(target.liquidationPrice || 0), 6)}` : null,
+            `Available: ${formatUsdCompact(Number(account.availableToSpendUsd || 0))} USD`,
+        ].filter(Boolean).join("\n"));
+
+        const keyboard = [
+            [
+                { text: "Close 25%", callback_data: `pc:${symbol}:${side}:25` },
+                { text: "Close 50%", callback_data: `pc:${symbol}:${side}:50` },
+                { text: "Close 100%", callback_data: `pc:${symbol}:${side}:100` },
+            ],
+            [
+                { text: "Refresh", callback_data: `pos:${symbol}:${side}` },
+                { text: "Positions", callback_data: "nav:positions" },
+                { text: "Home", callback_data: "nav:home" },
+            ],
+        ];
+
+        if (messageId && Number.isFinite(messageId) && messageId > 0) {
+            await this.editMessageText(chatId, messageId, text, {
+                inlineKeyboard: keyboard,
+            });
+            return;
+        }
+
+        await this.sendMessage(chatId, text, {
+            inlineKeyboard: keyboard,
         });
     }
 
@@ -475,7 +576,7 @@ export class TelegramAirificaClient {
                 ? ((Number(proposalData.tp) - Number(proposalData.entry)) / Math.max(0.0000001, Number(proposalData.entry) - Number(proposalData.sl)))
                 : ((Number(proposalData.entry) - Number(proposalData.tp)) / Math.max(0.0000001, Number(proposalData.sl) - Number(proposalData.entry)));
 
-            await this.sendMessage(chatId, this.buildProposalCardText({
+            const sent = await this.sendMessage(chatId, this.buildProposalCardText({
                 symbol: String(proposalData.symbol || prepared.market?.symbol || "TOKEN"),
                 timeframe: String(proposalData.timeframe || "1H"),
                 side: String(proposalData.side || "LONG"),
@@ -489,7 +590,23 @@ export class TelegramAirificaClient {
                 leverage: selectedLeverage,
                 maxLeverage,
             }), {
-                inlineKeyboard: this.buildPacificaTradeKeyboard(Number(prepared.proposalId), selectedPct, selectedLeverage, maxLeverage),
+                inlineKeyboard: this.buildPacificaTradeKeyboard({
+                    proposalId: Number(prepared.proposalId),
+                    marginPct: selectedPct,
+                    leverage: selectedLeverage,
+                    maxLeverage,
+                }),
+            });
+            this.proposalDrafts.set(this.getDraftKey(chatId, Number(prepared.proposalId)), {
+                chatId,
+                proposalId: Number(prepared.proposalId),
+                messageId: Number(sent?.message_id || 0),
+                availableUsd: Number(prepared.availableUsd || 0),
+                maxLeverage,
+                leverage: selectedLeverage,
+                collateralPct: selectedPct,
+                collateralUsd: null,
+                proposal: proposalData,
             });
             return;
         }
@@ -715,6 +832,79 @@ export class TelegramAirificaClient {
 
     private async handleConversationalMessage(chatId: string, text: string) {
         try {
+            const pendingInput = this.pendingCollateralInputs.get(chatId);
+            if (pendingInput) {
+                const numeric = Number(String(text).replace(",", ".").trim());
+                if (Number.isFinite(numeric) && numeric > 0) {
+                    const snapshot = await this.internalApi<any>(`/api/airi3/telegram/internal/proposals/${pendingInput.proposalId}`, {
+                        method: "POST",
+                        body: JSON.stringify({ chatId }),
+                    });
+                    const proposal = snapshot.proposal?.data || {};
+                    const maxLeverage = Math.max(1, Number(snapshot.proposal?.maxLeverage || 1));
+                    const existingDraft = this.proposalDrafts.get(this.getDraftKey(chatId, pendingInput.proposalId));
+                    const leverage = Math.max(1, Number(existingDraft?.leverage || 1));
+                    const availableUsd = Number(snapshot.availableUsd || existingDraft?.availableUsd || 0);
+                    const collateralUsd = Math.min(availableUsd, numeric);
+                    const messageId = Number(existingDraft?.messageId || 0);
+                    const rewardRisk = proposal.side === "LONG"
+                        ? ((Number(proposal.tp) - Number(proposal.entry)) / Math.max(0.0000001, Number(proposal.entry) - Number(proposal.sl)))
+                        : ((Number(proposal.entry) - Number(proposal.tp)) / Math.max(0.0000001, Number(proposal.sl) - Number(proposal.entry)));
+
+                    this.proposalDrafts.set(this.getDraftKey(chatId, pendingInput.proposalId), {
+                        chatId,
+                        proposalId: pendingInput.proposalId,
+                        messageId,
+                        availableUsd,
+                        maxLeverage,
+                        leverage,
+                        collateralPct: null,
+                        collateralUsd,
+                        proposal,
+                    });
+                    this.pendingCollateralInputs.delete(chatId);
+
+                    if (messageId > 0) {
+                        await this.editMessageText(chatId, messageId, this.buildProposalCardText({
+                            symbol: String(proposal.symbol || "TOKEN"),
+                            timeframe: String(proposal.timeframe || "1H"),
+                            side: String(proposal.side || "LONG"),
+                            rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
+                            confidencePct: Math.round(Number(proposal.confidence || 0) * 100),
+                            entry: Number(proposal.entry || 0),
+                            tp: Number(proposal.tp || 0),
+                            sl: Number(proposal.sl || 0),
+                            availableUsd,
+                            marginPct: null,
+                            marginUsd: collateralUsd,
+                            leverage,
+                            maxLeverage,
+                        }), {
+                            inlineKeyboard: this.buildPacificaTradeKeyboard({
+                                proposalId: pendingInput.proposalId,
+                                marginPct: null,
+                                leverage,
+                                maxLeverage,
+                            }),
+                        });
+                    }
+
+                    await this.sendMessage(chatId, `Collateral updated to ${formatUsdCompact(collateralUsd)} USD.`, {
+                        inlineKeyboard: [[
+                            { text: "Back to proposal", callback_data: `tgp:r:${pendingInput.proposalId}` },
+                        ]],
+                    });
+                    return;
+                }
+
+                await this.sendMessage(chatId, "Expected a collateral amount in USD. Example: 12.5", {
+                    inlineKeyboard: [[
+                        { text: "Back to proposal", callback_data: `tgp:r:${pendingInput.proposalId}` },
+                    ]],
+                });
+                return;
+            }
+
             const payload = await this.internalApi<any>("/api/airi3/telegram/internal/message", {
                 method: "POST",
                 body: JSON.stringify({ chatId, text }),
@@ -849,6 +1039,44 @@ export class TelegramAirificaClient {
                 return;
             }
 
+            if (data.startsWith("pos:")) {
+                const [, symbol, side] = data.split(":");
+                await this.answerCallbackQuery(callback.id);
+                await this.renderPositionDetail(chatId, symbol, side, messageId);
+                return;
+            }
+
+            if (data.startsWith("pc:")) {
+                const [, symbol, side, pctRaw] = data.split(":");
+                const pct = Math.min(100, Math.max(1, Number(pctRaw || 100)));
+                const payload = await this.internalApi<any>("/api/airi3/telegram/internal/positions", {
+                    method: "POST",
+                    body: JSON.stringify({ chatId }),
+                });
+                const positions = Array.isArray(payload.overview?.positions) ? payload.overview.positions : [];
+                const target = positions.find((position: any) => String(position.symbol) === symbol && String(position.side) === side);
+                if (!target) {
+                    await this.answerCallbackQuery(callback.id, "Position not found");
+                    await this.renderPositions(chatId);
+                    return;
+                }
+                const amount = Number(target.amount || 0) * (pct / 100);
+                const result = await this.internalApi<any>("/api/airi3/telegram/internal/close", {
+                    method: "POST",
+                    body: JSON.stringify({
+                        chatId,
+                        symbol,
+                        side,
+                        amount,
+                    }),
+                });
+                await this.answerCallbackQuery(callback.id, `Closed ${pct}%`);
+                await this.sendMessage(chatId, `Closed ${pct}% of ${result.closed.side} ${result.closed.symbol} (${formatNumberCompact(Number(result.closed.amount || 0), 6)}).`, {
+                    inlineKeyboard: this.buildHomeKeyboard(true),
+                });
+                return;
+            }
+
             if (data.startsWith("tgp:")) {
                 const [, action, proposalIdRaw, firstRaw, secondRaw] = data.split(":");
                 const proposalId = Number(proposalIdRaw);
@@ -857,12 +1085,32 @@ export class TelegramAirificaClient {
                     return;
                 }
 
+                const draftKey = this.getDraftKey(chatId, proposalId);
+                const snapshot = await this.internalApi<any>(`/api/airi3/telegram/internal/proposals/${proposalId}`, {
+                    method: "POST",
+                    body: JSON.stringify({ chatId }),
+                });
+                const proposal = snapshot.proposal?.data || {};
+                const maxLeverage = Math.max(1, Number(snapshot.proposal?.maxLeverage || 1));
+                const existingDraft = this.proposalDrafts.get(draftKey);
+                const availableUsd = Number(snapshot.availableUsd || existingDraft?.availableUsd || 0);
+                let leverage = Math.min(maxLeverage, Math.max(1, Number(existingDraft?.leverage || firstRaw || 1)));
+                let collateralPct = existingDraft?.collateralPct ?? 10;
+                let collateralUsd = existingDraft?.collateralUsd ?? null;
+
                 if (action === "x") {
-                    const collateralPct = Math.min(100, Math.max(1, Number(firstRaw || 10)));
-                    const leverage = Math.max(1, Number(secondRaw || 1));
+                    if (existingDraft?.collateralUsd != null) {
+                        collateralUsd = Math.min(availableUsd, Math.max(0, Number(existingDraft.collateralUsd)));
+                    } else {
+                        collateralPct = Math.min(100, Math.max(1, Number(existingDraft?.collateralPct || 10)));
+                    }
                     const result = await this.internalApi<any>(`/api/airi3/telegram/internal/proposals/${proposalId}/approve`, {
                         method: "POST",
-                        body: JSON.stringify({ chatId, collateral_pct: collateralPct, leverage }),
+                        body: JSON.stringify({
+                            chatId,
+                            ...(collateralUsd != null ? { collateral_usd: collateralUsd } : { collateral_pct: collateralPct }),
+                            leverage,
+                        }),
                     });
                     await this.answerCallbackQuery(callback.id, "Trade executed");
                     await this.sendMessage(
@@ -870,25 +1118,44 @@ export class TelegramAirificaClient {
                         `Opened ${result.side} ${result.symbol} with ${formatUsdCompact(result.marginUsd)} USD at ${result.leverage}x${result.orderId ? ` (${result.orderId})` : ""}.`,
                         { inlineKeyboard: this.buildHomeKeyboard(true) },
                     );
+                    this.proposalDrafts.delete(draftKey);
+                    this.pendingCollateralInputs.delete(chatId);
                     return;
                 }
 
-                const snapshot = await this.internalApi<any>(`/api/airi3/telegram/internal/proposals/${proposalId}`, {
-                    method: "POST",
-                    body: JSON.stringify({ chatId }),
-                });
-                const proposal = snapshot.proposal?.data || {};
-                const maxLeverage = Math.max(1, Number(snapshot.proposal?.maxLeverage || 1));
-                const collateralPct = action === "p"
-                    ? Math.min(100, Math.max(1, Number(firstRaw || 10)))
-                    : Math.min(100, Math.max(1, Number(secondRaw || 10)));
-                const leverage = action === "l"
-                    ? Math.min(maxLeverage, Math.max(1, Number(firstRaw || 1)))
-                    : Math.min(maxLeverage, Math.max(1, Number(secondRaw || 1)));
+                if (action === "s") {
+                    this.pendingCollateralInputs.set(chatId, { proposalId });
+                    await this.answerCallbackQuery(callback.id, "Send the collateral amount in USD as your next message");
+                    await this.sendMessage(chatId, "Send the collateral amount in USD as your next message. Example: 12.5");
+                    return;
+                }
+
+                if (action === "p") {
+                    collateralPct = Math.min(100, Math.max(1, Number(firstRaw || 10)));
+                    collateralUsd = null;
+                }
+                if (action === "l") {
+                    leverage = Math.min(maxLeverage, Math.max(1, Number(firstRaw || 1)));
+                }
+                if (action === "r") {
+                    leverage = Math.min(maxLeverage, Math.max(1, Number(existingDraft?.leverage || 1)));
+                }
+
                 const rewardRisk = proposal.side === "LONG"
                     ? ((Number(proposal.tp) - Number(proposal.entry)) / Math.max(0.0000001, Number(proposal.entry) - Number(proposal.sl)))
                     : ((Number(proposal.entry) - Number(proposal.tp)) / Math.max(0.0000001, Number(proposal.sl) - Number(proposal.entry)));
 
+                this.proposalDrafts.set(draftKey, {
+                    chatId,
+                    proposalId,
+                    messageId: Number.isFinite(messageId) && messageId > 0 ? messageId : Number(existingDraft?.messageId || 0),
+                    availableUsd,
+                    maxLeverage,
+                    leverage,
+                    collateralPct,
+                    collateralUsd,
+                    proposal,
+                });
                 await this.answerCallbackQuery(callback.id);
                 if (Number.isFinite(messageId) && messageId > 0) {
                     await this.editMessageText(chatId, messageId, this.buildProposalCardText({
@@ -900,12 +1167,18 @@ export class TelegramAirificaClient {
                         entry: Number(proposal.entry || 0),
                         tp: Number(proposal.tp || 0),
                         sl: Number(proposal.sl || 0),
-                        availableUsd: Number(snapshot.availableUsd || 0),
+                        availableUsd,
                         marginPct: collateralPct,
+                        marginUsd: collateralUsd,
                         leverage,
                         maxLeverage,
                     }), {
-                        inlineKeyboard: this.buildPacificaTradeKeyboard(proposalId, collateralPct, leverage, maxLeverage),
+                        inlineKeyboard: this.buildPacificaTradeKeyboard({
+                            proposalId,
+                            marginPct: collateralPct,
+                            leverage,
+                            maxLeverage,
+                        }),
                     });
                 }
                 return;
