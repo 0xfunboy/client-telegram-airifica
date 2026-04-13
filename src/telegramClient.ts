@@ -48,6 +48,12 @@ type TelegramProposalDraft = {
     proposal: any;
 };
 
+type PendingActionRequest = {
+    kind: "chart" | "price" | "analysis" | "fundamentals" | "news" | "sentiment";
+    promptPrefix: string;
+    title: string;
+};
+
 type TelegramMessageOptions = {
     inlineKeyboard?: Array<Array<TelegramInlineButton>>;
     parseMode?: "HTML";
@@ -118,6 +124,7 @@ export class TelegramAirificaClient {
     private readonly botUsername: string;
     private readonly proposalDrafts = new Map<string, TelegramProposalDraft>();
     private readonly pendingCollateralInputs = new Map<string, { proposalId: number }>();
+    private readonly pendingActionInputs = new Map<string, PendingActionRequest>();
 
     constructor(runtime: IAgentRuntime) {
         this.runtime = runtime;
@@ -466,8 +473,9 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
 
         if (linked) {
             keyboard.push([
+                { text: "Actions", callback_data: "nav:actions" },
                 { text: "Positions", callback_data: "nav:positions" },
-                { text: "Account", callback_data: "nav:status" },
+                { text: "Help", callback_data: "nav:help" },
             ]);
             keyboard.push([
                 { text: alertsEnabled ? "Alerts: on" : "Alerts: off", callback_data: alertsEnabled ? "alerts:off" : "alerts:on" },
@@ -475,9 +483,11 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             ]);
             keyboard.push([
                 { text: "Refresh", callback_data: "nav:home" },
+                { text: "Unlink", callback_data: "nav:unlink" },
             ]);
         } else {
             keyboard.push([
+                { text: "Help", callback_data: "nav:help" },
                 { text: "Refresh", callback_data: "nav:home" },
             ]);
         }
@@ -485,26 +495,61 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         return keyboard;
     }
 
-    private buildStatusKeyboard(link: { alertsEnabled?: boolean, conversationalEnabled?: boolean } | null) {
-        if (!link)
-            return this.buildHomeKeyboard(false);
-
+    private buildHelpKeyboard(linked: boolean) {
         return [
             [
-                {
-                    text: link.alertsEnabled ? "Alerts: on" : "Alerts: off",
-                    callback_data: link.alertsEnabled ? "alerts:off" : "alerts:on",
-                },
-                {
-                    text: link.conversationalEnabled ? "Chat: on" : "Chat: off",
-                    callback_data: link.conversationalEnabled ? "chat:off" : "chat:on",
-                },
-            ],
-            [
-                { text: "Positions", callback_data: "nav:positions" },
+                ...(linked ? [{ text: "Actions", callback_data: "nav:actions" }, { text: "Positions", callback_data: "nav:positions" }] : []),
                 { text: "Home", callback_data: "nav:home" },
             ],
         ];
+    }
+
+    private buildActionsKeyboard() {
+        return [
+            [
+                { text: "Chart", callback_data: "act:chart" },
+                { text: "Price", callback_data: "act:price" },
+            ],
+            [
+                { text: "Analysis", callback_data: "act:analysis" },
+                { text: "Fundamentals", callback_data: "act:fundamentals" },
+            ],
+            [
+                { text: "News", callback_data: "act:news" },
+                { text: "Sentiment", callback_data: "act:sentiment" },
+            ],
+            [
+                { text: "Trending", callback_data: "act:trending" },
+                { text: "Listings", callback_data: "act:listings" },
+            ],
+            [
+                { text: "Boosted", callback_data: "act:boosted" },
+                { text: "Most mentioned", callback_data: "act:mentioned" },
+            ],
+            [
+                { text: "Volume", callback_data: "act:volume" },
+                { text: "Home", callback_data: "nav:home" },
+            ],
+        ];
+    }
+
+    private getPendingActionRequest(kind: string): PendingActionRequest | null {
+        switch (kind) {
+            case "chart":
+                return { kind: "chart", promptPrefix: "Show the chart for", title: "Chart request" };
+            case "price":
+                return { kind: "price", promptPrefix: "What is the price of", title: "Price request" };
+            case "analysis":
+                return { kind: "analysis", promptPrefix: "Give me a technical analysis for", title: "Analysis request" };
+            case "fundamentals":
+                return { kind: "fundamentals", promptPrefix: "Give me the fundamentals for", title: "Fundamentals request" };
+            case "news":
+                return { kind: "news", promptPrefix: "Give me the latest news for", title: "News request" };
+            case "sentiment":
+                return { kind: "sentiment", promptPrefix: "What is the market sentiment for", title: "Sentiment request" };
+            default:
+                return null;
+        }
     }
 
     private async sendHome(chatId: string, messageId?: number) {
@@ -519,6 +564,8 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         const linked = Boolean(link);
         const lines = linked
             ? [
+                "Control your Airifica account from Telegram.",
+                "",
                 `Wallet <code>${escapeHtml(shortWallet(link.walletAddress))}</code>`,
                 summary ? `Equity <code>${escapeHtml(`${formatUsdCompact(summary.equityUsd)} USD`)}</code>` : null,
                 summary ? `Available <code>${escapeHtml(`${formatUsdCompact(summary.availableUsd)} USD`)}</code>` : null,
@@ -527,10 +574,12 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 summary?.latestTrade
                     ? `Last trade <code>${escapeHtml(`${summary.latestTrade.side} ${summary.latestTrade.symbol}`)}</code>`
                     : null,
+                "",
+                "<i>Use Actions for one-tap requests, Positions to manage open trades, and Help for the full guide.</i>",
             ].filter(Boolean) as string[]
             : [
                 "This chat is not linked yet.",
-                "Connect Telegram from Airifica.",
+                "Connect Telegram from Airifica to control positions and receive alerts here.",
                 "Fallback: <code>/link CODE</code>",
             ];
 
@@ -541,6 +590,55 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ].join("\n")), {
             parseMode: "HTML",
             inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled), Boolean(link?.conversationalEnabled)),
+        });
+    }
+
+    private async renderHelp(chatId: string, messageId?: number) {
+        let status: any = null;
+        try {
+            status = await this.getLinkStatus(chatId);
+        } catch {
+        }
+        const linked = Boolean(status?.link);
+        await this.sendOrEditMessage(chatId, messageId, compact([
+            "<b>Help</b>",
+            "",
+            "<b>What this bot can do</b>",
+            "• Answer market questions in natural language.",
+            "• Show charts and trade setups from ticker or contract address.",
+            "• Open Pacifica trades directly in Telegram.",
+            "• Show open positions and close 25%, 50% or 100%.",
+            "• Send trade alerts from Airifica into this chat.",
+            "",
+            "<b>How to use it</b>",
+            "• Use <b>Actions</b> for guided requests.",
+            "• Use <b>Positions</b> to inspect and close open trades.",
+            "• Toggle <b>Alerts</b> and <b>Chat</b> from Home.",
+            "• You can also just type normally, for example:",
+            "<code>chart BTC</code>",
+            "<code>price SOL</code>",
+            "<code>analysis 2jvsWRkT17ofmv9pkW7ofqAFWSCNyJYdykJ7kPKbmoon</code>",
+            "",
+            linked
+                ? "<i>Your wallet is linked and ready.</i>"
+                : "<i>Link Telegram from Airifica first, or use /link CODE as fallback.</i>",
+        ].join("\n")), {
+            parseMode: "HTML",
+            inlineKeyboard: this.buildHelpKeyboard(linked),
+        });
+    }
+
+    private async renderActions(chatId: string, messageId?: number) {
+        await this.sendOrEditMessage(chatId, messageId, compact([
+            "<b>Actions</b>",
+            "",
+            "Choose a guided action below.",
+            "",
+            "Some actions will ask for a <b>ticker</b> or <b>contract address</b>.",
+            "Others run immediately.",
+        ].join("\n")), {
+            parseMode: "HTML",
+            inlineKeyboard: this.buildActionsKeyboard(),
         });
     }
 
@@ -632,7 +730,11 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             `Conversation: <code>${escapeHtml(status.link.conversationalEnabled ? "on" : "off")}</code>`,
         ].filter(Boolean).join("\n")), {
             parseMode: "HTML",
-            inlineKeyboard: this.buildStatusKeyboard(status.link),
+            inlineKeyboard: [[
+                { text: "Positions", callback_data: "nav:positions" },
+                { text: "Actions", callback_data: "nav:actions" },
+                { text: "Home", callback_data: "nav:home" },
+            ]],
         });
     }
 
@@ -806,7 +908,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
         }
 
         if (parsed.command === "help" || parsed.command === "menu") {
-            await this.sendHome(chatId);
+            await this.renderHelp(chatId);
             return true;
         }
 
@@ -929,6 +1031,11 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             return true;
         }
 
+        if (parsed.command === "actions") {
+            await this.renderActions(chatId);
+            return true;
+        }
+
         return false;
     }
 
@@ -978,6 +1085,13 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                         { text: "Back to proposal", callback_data: `tgp:r:${pendingInput.proposalId}` },
                     ]],
                 });
+                return;
+            }
+
+            const pendingAction = this.pendingActionInputs.get(chatId);
+            if (pendingAction) {
+                this.pendingActionInputs.delete(chatId);
+                await this.handleConversationalMessage(chatId, `${pendingAction.promptPrefix} ${text}`);
                 return;
             }
 
@@ -1051,6 +1165,28 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 return;
             }
 
+            if (data === "nav:help") {
+                await this.answerCallbackQuery(callback.id);
+                await this.renderHelp(chatId, messageId);
+                return;
+            }
+
+            if (data === "nav:actions") {
+                await this.answerCallbackQuery(callback.id);
+                await this.renderActions(chatId, messageId);
+                return;
+            }
+
+            if (data === "nav:unlink") {
+                await this.internalApi("/api/airi3/telegram/internal/unlink", {
+                    method: "POST",
+                    body: JSON.stringify({ chatId }),
+                });
+                await this.answerCallbackQuery(callback.id, "Telegram unlinked");
+                await this.sendHome(chatId, messageId);
+                return;
+            }
+
             if (data === "alerts:on" || data === "alerts:off") {
                 const enabled = data === "alerts:on";
                 await this.internalApi("/api/airi3/telegram/internal/alerts/toggle", {
@@ -1077,6 +1213,49 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 await this.answerCallbackQuery(callback.id, enabled ? "Conversation enabled" : "Conversation disabled");
                 await this.sendHome(chatId, messageId);
                 return;
+            }
+
+            if (data.startsWith("act:")) {
+                const kind = data.slice(4);
+                const pending = this.getPendingActionRequest(kind);
+                if (pending) {
+                    this.pendingActionInputs.set(chatId, pending);
+                    await this.answerCallbackQuery(callback.id, "Send ticker or contract address");
+                    await this.sendOrEditMessage(chatId, messageId, compact([
+                        `<b>${escapeHtml(pending.title)}</b>`,
+                        "",
+                        "Send a <b>ticker</b> or <b>contract address</b> as your next message.",
+                        "",
+                        "<i>Examples</i>",
+                        "<code>BTC</code>",
+                        "<code>SOL</code>",
+                        "<code>2jvsWRkT17ofmv9pkW7ofqAFWSCNyJYdykJ7kPKbmoon</code>",
+                    ].join("\n")), {
+                        parseMode: "HTML",
+                        inlineKeyboard: [[
+                            { text: "Actions", callback_data: "nav:actions" },
+                            { text: "Home", callback_data: "nav:home" },
+                        ]],
+                    });
+                    return;
+                }
+
+                const directPrompt = kind === "trending"
+                    ? "Show me the trending tokens right now."
+                    : kind === "listings"
+                        ? "Show me the new token listings right now."
+                        : kind === "boosted"
+                            ? "Show me the boosted tokens right now."
+                            : kind === "mentioned"
+                                ? "What is the most mentioned ticker right now?"
+                                : kind === "volume"
+                                    ? "What is the total market volume right now?"
+                                    : "";
+                if (directPrompt) {
+                    await this.answerCallbackQuery(callback.id, "Running");
+                    await this.handleConversationalMessage(chatId, directPrompt);
+                    return;
+                }
             }
 
             if (data.startsWith("close:")) {
