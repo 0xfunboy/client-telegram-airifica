@@ -23,6 +23,17 @@ type TelegramResponse<T> = {
     description?: string;
 };
 
+type TelegramInlineButton = {
+    text: string;
+    callback_data?: string;
+    url?: string;
+};
+
+type TelegramBotCommand = {
+    command: string;
+    description: string;
+};
+
 function envValue(name: string, fallback = "") {
     return process.env[`AIRIFICA_${name}`] ?? process.env[`AIRI3_${name}`] ?? fallback;
 }
@@ -48,6 +59,8 @@ export class TelegramAirificaClient {
     private readonly internalSecret: string;
     private readonly pollTimeoutSeconds: number;
     private readonly alertPollMs: number;
+    private readonly publicAppUrl: string;
+    private readonly botUsername: string;
 
     constructor(runtime: IAgentRuntime) {
         this.runtime = runtime;
@@ -75,6 +88,18 @@ export class TelegramAirificaClient {
         ).trim();
         this.pollTimeoutSeconds = Math.max(10, Number(envValue("TELEGRAM_POLL_TIMEOUT_SECONDS", "50")));
         this.alertPollMs = Math.max(2000, Number(envValue("TELEGRAM_ALERT_POLL_MS", "5000")));
+        this.publicAppUrl = String(
+            runtime.getSetting("AIRIFICA_PUBLIC_APP_URL")
+            || runtime.getSetting("AIRI3_PUBLIC_APP_URL")
+            || envValue("PUBLIC_APP_URL")
+            || "",
+        ).trim().replace(/\/+$/, "");
+        this.botUsername = String(
+            runtime.getSetting("AIRIFICA_TELEGRAM_BOT_USERNAME")
+            || runtime.getSetting("AIRI3_TELEGRAM_BOT_USERNAME")
+            || envValue("TELEGRAM_BOT_USERNAME")
+            || "",
+        ).trim().replace(/^@/, "");
     }
 
     private get apiBase() {
@@ -109,7 +134,7 @@ export class TelegramAirificaClient {
         return payload as T;
     }
 
-    private async sendMessage(chatId: string, text: string, options?: { inlineKeyboard?: Array<Array<{ text: string; callback_data: string }>> }) {
+    private async sendMessage(chatId: string, text: string, options?: { inlineKeyboard?: Array<Array<TelegramInlineButton>> }) {
         const payload: Record<string, unknown> = {
             chat_id: chatId,
             text,
@@ -126,6 +151,120 @@ export class TelegramAirificaClient {
         await this.telegramApi("answerCallbackQuery", {
             callback_query_id: callbackQueryId,
             ...(text ? { text } : {}),
+        });
+    }
+
+    private async setCommands(commands: TelegramBotCommand[]) {
+        await this.telegramApi("setMyCommands", {
+            commands,
+        });
+    }
+
+    private getConnectWebUrl() {
+        if (!this.publicAppUrl)
+            return "";
+        const url = new URL(this.publicAppUrl);
+        url.searchParams.set("telegram", "connect");
+        url.searchParams.set("source", "telegram_bot");
+        return url.toString();
+    }
+
+    private getBotUrl() {
+        return this.botUsername ? `https://t.me/${this.botUsername}` : "";
+    }
+
+    private async getLinkStatus(chatId: string) {
+        return await this.internalApi<any>("/api/airi3/telegram/internal/link/status", {
+            method: "POST",
+            body: JSON.stringify({ chatId }),
+        });
+    }
+
+    private buildHomeKeyboard(linked: boolean, alertsEnabled = true) {
+        const keyboard: Array<Array<TelegramInlineButton>> = [];
+        const connectWebUrl = this.getConnectWebUrl();
+        const botUrl = this.getBotUrl();
+
+        if (connectWebUrl) {
+            keyboard.push([
+                { text: linked ? "Open Airifica" : "Link wallet in Airifica", url: connectWebUrl },
+            ]);
+        } else if (botUrl) {
+            keyboard.push([
+                { text: "Open bot", url: botUrl },
+            ]);
+        }
+
+        keyboard.push([
+            { text: "Positions", callback_data: "nav:positions" },
+            { text: "Status", callback_data: "nav:status" },
+        ]);
+
+        if (linked) {
+            keyboard.push([
+                { text: alertsEnabled ? "Alerts: on" : "Alerts: off", callback_data: alertsEnabled ? "alerts:off" : "alerts:on" },
+                { text: "Chat settings", callback_data: "nav:status" },
+            ]);
+            keyboard.push([
+                { text: "Refresh", callback_data: "nav:home" },
+            ]);
+        }
+
+        return keyboard;
+    }
+
+    private buildStatusKeyboard(link: { alertsEnabled?: boolean, conversationalEnabled?: boolean } | null) {
+        if (!link)
+            return this.buildHomeKeyboard(false);
+
+        return [
+            [
+                {
+                    text: link.alertsEnabled ? "Alerts: on" : "Alerts: off",
+                    callback_data: link.alertsEnabled ? "alerts:off" : "alerts:on",
+                },
+                {
+                    text: link.conversationalEnabled ? "Chat: on" : "Chat: off",
+                    callback_data: link.conversationalEnabled ? "chat:off" : "chat:on",
+                },
+            ],
+            [
+                { text: "Positions", callback_data: "nav:positions" },
+                { text: "Home", callback_data: "nav:home" },
+            ],
+        ];
+    }
+
+    private async sendHome(chatId: string) {
+        let status: any = null;
+        try {
+            status = await this.getLinkStatus(chatId);
+        } catch {
+        }
+
+        const link = status?.link || null;
+        const linked = Boolean(link);
+        const lines = linked
+            ? [
+                "Airifica Telegram control surface.",
+                "",
+                `Wallet: ${link.walletAddress}`,
+                `Alerts: ${link.alertsEnabled ? "on" : "off"}`,
+                `Conversation: ${link.conversationalEnabled ? "on" : "off"}`,
+                "",
+                "Use the buttons below or send a natural-language message.",
+            ]
+            : [
+                "Airifica Telegram control surface.",
+                "",
+                "This chat is not linked yet.",
+                "Open Airifica, connect your wallet, then tap Connect Telegram.",
+                "",
+                "Manual fallback: /link CODE",
+            ];
+
+        await this.sendMessage(chatId, compact(lines.join("\n")), {
+            inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled)),
         });
     }
 
@@ -175,7 +314,13 @@ export class TelegramAirificaClient {
         ]));
 
         await this.sendMessage(chatId, compact(lines.join("\n")), {
-            inlineKeyboard: keyboard,
+            inlineKeyboard: [
+                ...keyboard,
+                [
+                    { text: "Refresh positions", callback_data: "nav:positions" },
+                    { text: "Home", callback_data: "nav:home" },
+                ],
+            ],
         });
     }
 
@@ -197,23 +342,23 @@ export class TelegramAirificaClient {
                         firstName,
                     }),
                 });
-                await this.sendMessage(chatId, `Linked to wallet ${linkResult.link.walletAddress}. Alerts are on and chat is ready.`);
+                await this.sendMessage(chatId, `Linked to wallet ${linkResult.link.walletAddress}. Alerts are on and chat is ready.`, {
+                    inlineKeyboard: this.buildHomeKeyboard(true, Boolean(linkResult.link.alertsEnabled)),
+                });
                 return true;
             }
 
-            await this.sendMessage(chatId, compact([
-                "Airifica Telegram bot.",
-                "",
-                "Commands:",
-                "/link CODE",
-                "/positions",
-                "/close SYMBOL",
-                "/alerts on|off",
-                "/status",
-                "/unlink",
-                "",
-                "Any plain message after linking is sent to the Airifica conversational runtime.",
-            ].join("\n")));
+            await this.sendHome(chatId);
+            return true;
+        }
+
+        if (parsed.command === "help" || parsed.command === "menu") {
+            await this.sendHome(chatId);
+            return true;
+        }
+
+        if (parsed.command === "settings") {
+            await this.sendHome(chatId);
             return true;
         }
 
@@ -232,24 +377,25 @@ export class TelegramAirificaClient {
                     firstName,
                 }),
             });
-            await this.sendMessage(chatId, `Linked to wallet ${linkResult.link.walletAddress}.`);
+            await this.sendMessage(chatId, `Linked to wallet ${linkResult.link.walletAddress}.`, {
+                inlineKeyboard: this.buildHomeKeyboard(true, Boolean(linkResult.link.alertsEnabled)),
+            });
             return true;
         }
 
         if (parsed.command === "status") {
-            const status = await this.internalApi<any>("/api/airi3/telegram/internal/link/status", {
-                method: "POST",
-                body: JSON.stringify({ chatId }),
-            });
+            const status = await this.getLinkStatus(chatId);
             if (!status.link) {
-                await this.sendMessage(chatId, "This Telegram chat is not linked yet.");
+                await this.sendHome(chatId);
                 return true;
             }
             await this.sendMessage(chatId, compact([
                 `Linked wallet: ${status.link.walletAddress}`,
                 `Alerts: ${status.link.alertsEnabled ? "on" : "off"}`,
                 `Conversation: ${status.link.conversationalEnabled ? "on" : "off"}`,
-            ].join("\n")));
+            ].join("\n")), {
+                inlineKeyboard: this.buildHomeKeyboard(true, Boolean(status.link.alertsEnabled)),
+            });
             return true;
         }
 
@@ -263,7 +409,28 @@ export class TelegramAirificaClient {
                 method: "POST",
                 body: JSON.stringify({ chatId, enabled: value === "on" }),
             });
-            await this.sendMessage(chatId, `Alerts ${value === "on" ? "enabled" : "disabled"}.`);
+            await this.sendMessage(chatId, `Alerts ${value === "on" ? "enabled" : "disabled"}.`, {
+                inlineKeyboard: this.buildHomeKeyboard(true, value === "on"),
+            });
+            return true;
+        }
+
+        if (parsed.command === "chat") {
+            const value = parsed.args[0]?.toLowerCase();
+            if (value !== "on" && value !== "off") {
+                await this.sendMessage(chatId, "Usage: /chat on|off");
+                return true;
+            }
+            await this.internalApi("/api/airi3/telegram/internal/chat/toggle", {
+                method: "POST",
+                body: JSON.stringify({
+                    chatId,
+                    enabled: value === "on",
+                }),
+            });
+            await this.sendMessage(chatId, `Telegram conversation ${value === "on" ? "enabled" : "disabled"}.`, {
+                inlineKeyboard: this.buildHomeKeyboard(true),
+            });
             return true;
         }
 
@@ -272,7 +439,9 @@ export class TelegramAirificaClient {
                 method: "POST",
                 body: JSON.stringify({ chatId }),
             });
-            await this.sendMessage(chatId, "Telegram chat unlinked from Airifica.");
+            await this.sendMessage(chatId, "Telegram chat unlinked from Airifica.", {
+                inlineKeyboard: this.buildHomeKeyboard(false),
+            });
             return true;
         }
 
@@ -297,7 +466,14 @@ export class TelegramAirificaClient {
                     ...(side === "LONG" || side === "SHORT" ? { side } : {}),
                 }),
             });
-            await this.sendMessage(chatId, `Closed ${result.closed.side} ${result.closed.symbol} (${result.closed.amount}).`);
+            await this.sendMessage(chatId, `Closed ${result.closed.side} ${result.closed.symbol} (${result.closed.amount}).`, {
+                inlineKeyboard: this.buildHomeKeyboard(true),
+            });
+            return true;
+        }
+
+        if (parsed.command === "open") {
+            await this.sendHome(chatId);
             return true;
         }
 
@@ -305,20 +481,37 @@ export class TelegramAirificaClient {
     }
 
     private async handleConversationalMessage(chatId: string, text: string) {
-        const payload = await this.internalApi<any>("/api/airi3/telegram/internal/message", {
-            method: "POST",
-            body: JSON.stringify({ chatId, text }),
-        });
-        const responses = Array.isArray(payload.responses) ? payload.responses : [];
-        if (!responses.length) {
-            await this.sendMessage(chatId, "No response generated.");
-            return;
-        }
+        try {
+            const payload = await this.internalApi<any>("/api/airi3/telegram/internal/message", {
+                method: "POST",
+                body: JSON.stringify({ chatId, text }),
+            });
+            const responses = Array.isArray(payload.responses) ? payload.responses : [];
+            if (!responses.length) {
+                await this.sendMessage(chatId, "No response generated.", {
+                    inlineKeyboard: this.buildHomeKeyboard(true),
+                });
+                return;
+            }
 
-        for (const response of responses) {
-            const replyText = String(response?.message?.text || "").trim();
-            if (replyText)
-                await this.sendMessage(chatId, replyText);
+            for (const response of responses) {
+                const replyText = String(response?.message?.text || "").trim();
+                if (replyText)
+                    await this.sendMessage(chatId, replyText);
+            }
+        } catch (error) {
+            const message = describeError(error);
+            if (/not linked/i.test(message) || /link not found/i.test(message)) {
+                await this.sendHome(chatId);
+                return;
+            }
+            if (/conversation is disabled/i.test(message)) {
+                await this.sendMessage(chatId, "Conversational replies are off for this chat. Use /chat on to re-enable them.", {
+                    inlineKeyboard: this.buildHomeKeyboard(true),
+                });
+                return;
+            }
+            throw error;
         }
     }
 
@@ -334,6 +527,63 @@ export class TelegramAirificaClient {
             return;
 
         try {
+            if (data === "nav:home") {
+                await this.answerCallbackQuery(callback.id);
+                await this.sendHome(chatId);
+                return;
+            }
+
+            if (data === "nav:positions") {
+                await this.answerCallbackQuery(callback.id);
+                await this.renderPositions(chatId);
+                return;
+            }
+
+            if (data === "nav:status") {
+                const status = await this.getLinkStatus(chatId);
+                await this.answerCallbackQuery(callback.id);
+                if (!status.link) {
+                    await this.sendHome(chatId);
+                    return;
+                }
+                await this.sendMessage(chatId, compact([
+                    `Linked wallet: ${status.link.walletAddress}`,
+                    `Alerts: ${status.link.alertsEnabled ? "on" : "off"}`,
+                    `Conversation: ${status.link.conversationalEnabled ? "on" : "off"}`,
+                ].join("\n")), {
+                    inlineKeyboard: this.buildStatusKeyboard(status.link),
+                });
+                return;
+            }
+
+            if (data === "alerts:on" || data === "alerts:off") {
+                const enabled = data === "alerts:on";
+                await this.internalApi("/api/airi3/telegram/internal/alerts/toggle", {
+                    method: "POST",
+                    body: JSON.stringify({ chatId, enabled }),
+                });
+                await this.answerCallbackQuery(callback.id, enabled ? "Alerts enabled" : "Alerts disabled");
+                await this.sendHome(chatId);
+                return;
+            }
+
+            if (data === "chat:on" || data === "chat:off") {
+                const enabled = data === "chat:on";
+                const status = await this.getLinkStatus(chatId);
+                if (!status.link) {
+                    await this.answerCallbackQuery(callback.id, "Chat not linked");
+                    await this.sendHome(chatId);
+                    return;
+                }
+                await this.internalApi("/api/airi3/telegram/internal/chat/toggle", {
+                    method: "POST",
+                    body: JSON.stringify({ chatId, enabled }),
+                });
+                await this.answerCallbackQuery(callback.id, enabled ? "Conversation enabled" : "Conversation disabled");
+                await this.sendHome(chatId);
+                return;
+            }
+
             if (data.startsWith("close:")) {
                 const [, symbol, side] = data.split(":");
                 const result = await this.internalApi<any>("/api/airi3/telegram/internal/close", {
@@ -345,7 +595,9 @@ export class TelegramAirificaClient {
                     }),
                 });
                 await this.answerCallbackQuery(callback.id, `Closed ${result.closed.symbol}`);
-                await this.sendMessage(chatId, `Closed ${result.closed.side} ${result.closed.symbol} (${result.closed.amount}).`);
+                await this.sendMessage(chatId, `Closed ${result.closed.side} ${result.closed.symbol} (${result.closed.amount}).`, {
+                    inlineKeyboard: this.buildHomeKeyboard(true),
+                });
                 return;
             }
 
@@ -442,6 +694,19 @@ export class TelegramAirificaClient {
             await this.telegramApi("deleteWebhook", { drop_pending_updates: true });
         } catch (error) {
             elizaLogger.warn(`[client-telegram-airifica] deleteWebhook skipped: ${describeError(error)}`);
+        }
+        try {
+            await this.setCommands([
+                { command: "start", description: "Open the Airifica Telegram home" },
+                { command: "positions", description: "View open Pacifica positions" },
+                { command: "status", description: "Show linked wallet and bot status" },
+                { command: "alerts", description: "Toggle Telegram alerts on or off" },
+                { command: "chat", description: "Enable or disable conversational replies" },
+                { command: "close", description: "Close an open Pacifica position" },
+                { command: "unlink", description: "Unlink this Telegram chat from Airifica" },
+            ]);
+        } catch (error) {
+            elizaLogger.warn(`[client-telegram-airifica] setMyCommands skipped: ${describeError(error)}`);
         }
 
         this.pollPromise = this.pollLoop();
