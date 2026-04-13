@@ -36,6 +36,23 @@ type TelegramBotCommand = {
     description: string;
 };
 
+type TelegramProposalDraft = {
+    chatId: string;
+    proposalId: number;
+    messageId: number;
+    availableUsd: number;
+    maxLeverage: number;
+    leverage: number;
+    collateralPct: number | null;
+    collateralUsd: number | null;
+    proposal: any;
+};
+
+type TelegramMessageOptions = {
+    inlineKeyboard?: Array<Array<TelegramInlineButton>>;
+    parseMode?: "HTML";
+};
+
 function envValue(name: string, fallback = "") {
     return process.env[`AIRIFICA_${name}`] ?? process.env[`AIRI3_${name}`] ?? fallback;
 }
@@ -48,6 +65,13 @@ function describeError(error: unknown) {
     if (error instanceof Error)
         return error.message;
     return String(error ?? "unknown error");
+}
+
+function escapeHtml(value: unknown) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
 }
 
 function formatUsdCompact(value: number) {
@@ -80,17 +104,7 @@ export class TelegramAirificaClient {
     private readonly alertPollMs: number;
     private readonly publicAppUrl: string;
     private readonly botUsername: string;
-    private readonly proposalDrafts = new Map<string, {
-        chatId: string;
-        proposalId: number;
-        messageId: number;
-        availableUsd: number;
-        maxLeverage: number;
-        leverage: number;
-        collateralPct: number | null;
-        collateralUsd: number | null;
-        proposal: any;
-    }>();
+    private readonly proposalDrafts = new Map<string, TelegramProposalDraft>();
     private readonly pendingCollateralInputs = new Map<string, { proposalId: number }>();
 
     constructor(runtime: IAgentRuntime) {
@@ -165,11 +179,13 @@ export class TelegramAirificaClient {
         return payload as T;
     }
 
-    private async sendMessage(chatId: string, text: string, options?: { inlineKeyboard?: Array<Array<TelegramInlineButton>> }) {
+    private async sendMessage(chatId: string, text: string, options?: TelegramMessageOptions) {
         const payload: Record<string, unknown> = {
             chat_id: chatId,
             text,
         };
+        if (options?.parseMode)
+            payload.parse_mode = options.parseMode;
         if (options?.inlineKeyboard?.length) {
             payload.reply_markup = {
                 inline_keyboard: options.inlineKeyboard,
@@ -210,12 +226,21 @@ export class TelegramAirificaClient {
             throw new Error(payload.description || "Telegram API sendPhoto failed");
     }
 
-    private async editMessageText(chatId: string, messageId: number, text: string, options?: { inlineKeyboard?: Array<Array<TelegramInlineButton>> }) {
+    private async deleteMessage(chatId: string, messageId: number) {
+        await this.telegramApi("deleteMessage", {
+            chat_id: chatId,
+            message_id: messageId,
+        });
+    }
+
+    private async editMessageText(chatId: string, messageId: number, text: string, options?: TelegramMessageOptions) {
         const payload: Record<string, unknown> = {
             chat_id: chatId,
             message_id: messageId,
             text,
         };
+        if (options?.parseMode)
+            payload.parse_mode = options.parseMode;
         if (options?.inlineKeyboard?.length) {
             payload.reply_markup = {
                 inline_keyboard: options.inlineKeyboard,
@@ -273,13 +298,13 @@ export class TelegramAirificaClient {
         )).sort((left, right) => left - right).slice(0, 4);
 
         const leverageButtons = leverageOptions.map((value) => ({
-            text: value === draft.leverage ? `[${value}x]` : `${value}x`,
+            text: value === draft.leverage ? `● ${value}x` : `${value}x`,
             callback_data: `tgp:l:${draft.proposalId}:${value}`,
         }));
         const collateralButtons = [10, 20, 30, 100].map((value) => ({
             text: value === 100
-                ? (draft.marginPct === 100 ? "[MAX]" : "MAX")
-                : (draft.marginPct === value ? `[${value}%]` : `${value}%`),
+                ? (draft.marginPct === 100 ? "● MAX" : "MAX")
+                : (draft.marginPct === value ? `● ${value}%` : `${value}%`),
             callback_data: `tgp:p:${draft.proposalId}:${value}`,
         }));
 
@@ -287,8 +312,8 @@ export class TelegramAirificaClient {
             leverageButtons,
             collateralButtons,
             [
-                { text: "Set size USD", callback_data: `tgp:s:${draft.proposalId}` },
-                { text: "Execute trade", callback_data: `tgp:x:${draft.proposalId}` },
+                { text: "Set USD", callback_data: `tgp:s:${draft.proposalId}` },
+                { text: "Execute", callback_data: `tgp:x:${draft.proposalId}` },
             ],
             [
                 { text: "Refresh", callback_data: `tgp:r:${draft.proposalId}` },
@@ -319,20 +344,71 @@ export class TelegramAirificaClient {
         const notionalUsd = marginUsd * input.leverage;
         const quantity = input.entry > 0 ? notionalUsd / input.entry : 0;
         const rrText = Number.isFinite(input.rr) && input.rr && input.rr > 0 ? `R/R ${formatNumberCompact(input.rr, 2)}` : "R/R -";
-        const collateralLabel = input.marginPct != null
-            ? `Collateral: ${formatUsdCompact(marginUsd)} USD (${input.marginPct}% of available ${formatUsdCompact(input.availableUsd)} USD)`
-            : `Collateral: ${formatUsdCompact(marginUsd)} USD (custom size, available ${formatUsdCompact(input.availableUsd)} USD)`;
+        const selectedSize = input.marginPct != null
+            ? `${input.marginPct}% of ${formatUsdCompact(input.availableUsd)} USD`
+            : `custom ${formatUsdCompact(marginUsd)} USD`;
         return compact([
-            `$${input.symbol} ${input.timeframe} | ${input.side} | ${rrText} | Confidence ${input.confidencePct}%`,
-            `Entry: ${formatNumberCompact(input.entry, 6)}`,
-            `TP: ${formatNumberCompact(input.tp, 6)}`,
-            `SL: ${formatNumberCompact(input.sl, 6)}`,
+            `<b>$${escapeHtml(input.symbol)}</b> <i>${escapeHtml(input.timeframe)}</i> <u>${escapeHtml(input.side)}</u>`,
+            `<b>${escapeHtml(rrText)}</b>  <b>Confidence</b> <code>${escapeHtml(`${input.confidencePct}%`)}</code>`,
             "",
-            collateralLabel,
-            `Leverage: ${input.leverage}x / ${Math.max(1, input.maxLeverage)}x max`,
-            `Quantity: ${formatNumberCompact(quantity, 6)} ${input.symbol}`,
-            `Position size: ${formatUsdCompact(notionalUsd)} USD`,
+            `<i>Execution setup</i>`,
+            `<pre>Entry         ${escapeHtml(formatNumberCompact(input.entry, 6))}
+Take profit   ${escapeHtml(formatNumberCompact(input.tp, 6))}
+Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
+            `<b>Collateral</b> <code>${escapeHtml(formatUsdCompact(marginUsd))} USD</code>`,
+            `<i>Selected size</i> <code>${escapeHtml(selectedSize)}</code>`,
+            `<b>Leverage</b> <code>${escapeHtml(`${input.leverage}x / ${Math.max(1, input.maxLeverage)}x max`)}</code>`,
+            `<b>Quantity</b> <code>${escapeHtml(`${formatNumberCompact(quantity, 6)} ${input.symbol}`)}</code>`,
+            `<b>Position size</b> <code>${escapeHtml(`${formatUsdCompact(notionalUsd)} USD`)}</code>`,
+            "",
+            `<i>Available collateral</i> <code>${escapeHtml(`${formatUsdCompact(input.availableUsd)} USD`)}</code>`,
         ].join("\n"));
+    }
+
+    private async replaceProposalCard(chatId: string, draft: TelegramProposalDraft) {
+        const proposal = draft.proposal || {};
+        const rewardRisk = proposal.side === "LONG"
+            ? ((Number(proposal.tp) - Number(proposal.entry)) / Math.max(0.0000001, Number(proposal.entry) - Number(proposal.sl)))
+            : ((Number(proposal.entry) - Number(proposal.tp)) / Math.max(0.0000001, Number(proposal.sl) - Number(proposal.entry)));
+        const text = this.buildProposalCardText({
+            symbol: String(proposal.symbol || "TOKEN"),
+            timeframe: String(proposal.timeframe || "1H"),
+            side: String(proposal.side || "LONG"),
+            rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
+            confidencePct: Math.round(Number(proposal.confidence || 0) * 100),
+            entry: Number(proposal.entry || 0),
+            tp: Number(proposal.tp || 0),
+            sl: Number(proposal.sl || 0),
+            availableUsd: draft.availableUsd,
+            marginPct: draft.collateralPct,
+            marginUsd: draft.collateralUsd,
+            leverage: draft.leverage,
+            maxLeverage: draft.maxLeverage,
+        });
+
+        if (draft.messageId > 0) {
+            try {
+                await this.deleteMessage(chatId, draft.messageId);
+            } catch {
+            }
+        }
+
+        const sent = await this.sendMessage(chatId, text, {
+            parseMode: "HTML",
+            inlineKeyboard: this.buildPacificaTradeKeyboard({
+                proposalId: draft.proposalId,
+                marginPct: draft.collateralPct,
+                leverage: draft.leverage,
+                maxLeverage: draft.maxLeverage,
+            }),
+        });
+
+        const nextDraft: TelegramProposalDraft = {
+            ...draft,
+            messageId: Number(sent?.message_id || 0),
+        };
+        this.proposalDrafts.set(this.getDraftKey(chatId, draft.proposalId), nextDraft);
+        return nextDraft;
     }
 
     private async getLinkStatus(chatId: string) {
@@ -433,7 +509,12 @@ export class TelegramAirificaClient {
                 "Manual fallback: /link CODE",
             ];
 
-        await this.sendMessage(chatId, compact(lines.join("\n")), {
+        await this.sendMessage(chatId, compact([
+            "<b>Airifica Telegram</b>",
+            "",
+            ...lines,
+        ].join("\n")), {
+            parseMode: "HTML",
             inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled)),
         });
     }
@@ -483,7 +564,12 @@ export class TelegramAirificaClient {
             },
         ]));
 
-        await this.sendMessage(chatId, compact(lines.join("\n")), {
+        await this.sendMessage(chatId, compact([
+            "<b>Open positions</b>",
+            "",
+            ...lines,
+        ].join("\n")), {
+            parseMode: "HTML",
             inlineKeyboard: [
                 ...keyboard,
                 [
@@ -523,17 +609,17 @@ export class TelegramAirificaClient {
         }
 
         const text = compact([
-            `${target.symbol} ${target.side}`,
-            `Amount: ${formatNumberCompact(Number(target.amount || 0), 6)}`,
-            `Entry: ${formatNumberCompact(Number(target.entryPrice || 0), 6)}`,
-            `Mark: ${formatNumberCompact(Number(target.markPrice || 0), 6)}`,
-            `PnL: ${Number(target.unrealizedPnlUsd || 0) >= 0 ? "+" : ""}${formatUsdCompact(Number(target.unrealizedPnlUsd || 0))} USD (${formatNumberCompact(Number(target.unrealizedPnlPct || 0), 2)}%)`,
-            `Notional: ${formatUsdCompact(Number(target.notionalUsd || 0))} USD`,
-            `Margin: ${formatUsdCompact(Number(target.margin || 0))} USD`,
-            target.takeProfitPrice ? `TP: ${formatNumberCompact(Number(target.takeProfitPrice || 0), 6)}` : null,
-            target.stopLossPrice ? `SL: ${formatNumberCompact(Number(target.stopLossPrice || 0), 6)}` : null,
-            target.liquidationPrice ? `Liq: ${formatNumberCompact(Number(target.liquidationPrice || 0), 6)}` : null,
-            `Available: ${formatUsdCompact(Number(account.availableToSpendUsd || 0))} USD`,
+            `<b>${escapeHtml(`${target.symbol} ${target.side}`)}</b>`,
+            `<pre>Amount        ${escapeHtml(formatNumberCompact(Number(target.amount || 0), 6))}
+Entry         ${escapeHtml(formatNumberCompact(Number(target.entryPrice || 0), 6))}
+Mark          ${escapeHtml(formatNumberCompact(Number(target.markPrice || 0), 6))}
+PnL           ${escapeHtml(`${Number(target.unrealizedPnlUsd || 0) >= 0 ? "+" : ""}${formatUsdCompact(Number(target.unrealizedPnlUsd || 0))} USD (${formatNumberCompact(Number(target.unrealizedPnlPct || 0), 2)}%)`)}
+Notional      ${escapeHtml(`${formatUsdCompact(Number(target.notionalUsd || 0))} USD`)}
+Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`)}</pre>`,
+            target.takeProfitPrice ? `<b>TP</b> <code>${escapeHtml(formatNumberCompact(Number(target.takeProfitPrice || 0), 6))}</code>` : null,
+            target.stopLossPrice ? `<b>SL</b> <code>${escapeHtml(formatNumberCompact(Number(target.stopLossPrice || 0), 6))}</code>` : null,
+            target.liquidationPrice ? `<b>Liq</b> <code>${escapeHtml(formatNumberCompact(Number(target.liquidationPrice || 0), 6))}</code>` : null,
+            `<i>Available</i> <code>${escapeHtml(`${formatUsdCompact(Number(account.availableToSpendUsd || 0))} USD`)}</code>`,
         ].filter(Boolean).join("\n"));
 
         const keyboard = [
@@ -551,12 +637,14 @@ export class TelegramAirificaClient {
 
         if (messageId && Number.isFinite(messageId) && messageId > 0) {
             await this.editMessageText(chatId, messageId, text, {
+                parseMode: "HTML",
                 inlineKeyboard: keyboard,
             });
             return;
         }
 
         await this.sendMessage(chatId, text, {
+            parseMode: "HTML",
             inlineKeyboard: keyboard,
         });
     }
@@ -572,42 +660,18 @@ export class TelegramAirificaClient {
             const selectedPct = 10;
             const selectedLeverage = 1;
             const proposalData = prepared.proposal || {};
-            const rewardRisk = proposalData.side === "LONG"
-                ? ((Number(proposalData.tp) - Number(proposalData.entry)) / Math.max(0.0000001, Number(proposalData.entry) - Number(proposalData.sl)))
-                : ((Number(proposalData.entry) - Number(proposalData.tp)) / Math.max(0.0000001, Number(proposalData.sl) - Number(proposalData.entry)));
-
-            const sent = await this.sendMessage(chatId, this.buildProposalCardText({
-                symbol: String(proposalData.symbol || prepared.market?.symbol || "TOKEN"),
-                timeframe: String(proposalData.timeframe || "1H"),
-                side: String(proposalData.side || "LONG"),
-                rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
-                confidencePct: Math.round(Number(proposalData.confidence || 0) * 100),
-                entry: Number(proposalData.entry || 0),
-                tp: Number(proposalData.tp || 0),
-                sl: Number(proposalData.sl || 0),
-                availableUsd: Number(prepared.availableUsd || 0),
-                marginPct: selectedPct,
-                leverage: selectedLeverage,
-                maxLeverage,
-            }), {
-                inlineKeyboard: this.buildPacificaTradeKeyboard({
-                    proposalId: Number(prepared.proposalId),
-                    marginPct: selectedPct,
-                    leverage: selectedLeverage,
-                    maxLeverage,
-                }),
-            });
-            this.proposalDrafts.set(this.getDraftKey(chatId, Number(prepared.proposalId)), {
+            const draft = {
                 chatId,
                 proposalId: Number(prepared.proposalId),
-                messageId: Number(sent?.message_id || 0),
+                messageId: 0,
                 availableUsd: Number(prepared.availableUsd || 0),
                 maxLeverage,
                 leverage: selectedLeverage,
                 collateralPct: selectedPct,
                 collateralUsd: null,
                 proposal: proposalData,
-            });
+            };
+            await this.replaceProposalCard(chatId, draft);
             return;
         }
 
@@ -847,11 +911,7 @@ export class TelegramAirificaClient {
                     const availableUsd = Number(snapshot.availableUsd || existingDraft?.availableUsd || 0);
                     const collateralUsd = Math.min(availableUsd, numeric);
                     const messageId = Number(existingDraft?.messageId || 0);
-                    const rewardRisk = proposal.side === "LONG"
-                        ? ((Number(proposal.tp) - Number(proposal.entry)) / Math.max(0.0000001, Number(proposal.entry) - Number(proposal.sl)))
-                        : ((Number(proposal.entry) - Number(proposal.tp)) / Math.max(0.0000001, Number(proposal.sl) - Number(proposal.entry)));
-
-                    this.proposalDrafts.set(this.getDraftKey(chatId, pendingInput.proposalId), {
+                    const nextDraft = {
                         chatId,
                         proposalId: pendingInput.proposalId,
                         messageId,
@@ -861,33 +921,11 @@ export class TelegramAirificaClient {
                         collateralPct: null,
                         collateralUsd,
                         proposal,
-                    });
+                    };
+                    this.proposalDrafts.set(this.getDraftKey(chatId, pendingInput.proposalId), nextDraft);
                     this.pendingCollateralInputs.delete(chatId);
 
-                    if (messageId > 0) {
-                        await this.editMessageText(chatId, messageId, this.buildProposalCardText({
-                            symbol: String(proposal.symbol || "TOKEN"),
-                            timeframe: String(proposal.timeframe || "1H"),
-                            side: String(proposal.side || "LONG"),
-                            rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
-                            confidencePct: Math.round(Number(proposal.confidence || 0) * 100),
-                            entry: Number(proposal.entry || 0),
-                            tp: Number(proposal.tp || 0),
-                            sl: Number(proposal.sl || 0),
-                            availableUsd,
-                            marginPct: null,
-                            marginUsd: collateralUsd,
-                            leverage,
-                            maxLeverage,
-                        }), {
-                            inlineKeyboard: this.buildPacificaTradeKeyboard({
-                                proposalId: pendingInput.proposalId,
-                                marginPct: null,
-                                leverage,
-                                maxLeverage,
-                            }),
-                        });
-                    }
+                    await this.replaceProposalCard(chatId, nextDraft);
 
                     await this.sendMessage(chatId, `Collateral updated to ${formatUsdCompact(collateralUsd)} USD.`, {
                         inlineKeyboard: [[
@@ -921,10 +959,10 @@ export class TelegramAirificaClient {
                 const replyImage = String(response?.message?.image || "").trim();
                 const replyText = String(response?.message?.text || "").trim();
                 const proposal = response?.message?.proposal || null;
-                if (replyImage)
-                    await this.sendPhoto(chatId, replyImage);
                 if (replyText)
                     await this.sendMessage(chatId, replyText);
+                if (replyImage)
+                    await this.sendPhoto(chatId, replyImage);
                 if (proposal)
                     await this.sendProposalCard(chatId, text, proposal);
             }
@@ -1141,11 +1179,7 @@ export class TelegramAirificaClient {
                     leverage = Math.min(maxLeverage, Math.max(1, Number(existingDraft?.leverage || 1)));
                 }
 
-                const rewardRisk = proposal.side === "LONG"
-                    ? ((Number(proposal.tp) - Number(proposal.entry)) / Math.max(0.0000001, Number(proposal.entry) - Number(proposal.sl)))
-                    : ((Number(proposal.entry) - Number(proposal.tp)) / Math.max(0.0000001, Number(proposal.sl) - Number(proposal.entry)));
-
-                this.proposalDrafts.set(draftKey, {
+                const nextDraft = {
                     chatId,
                     proposalId,
                     messageId: Number.isFinite(messageId) && messageId > 0 ? messageId : Number(existingDraft?.messageId || 0),
@@ -1155,32 +1189,10 @@ export class TelegramAirificaClient {
                     collateralPct,
                     collateralUsd,
                     proposal,
-                });
+                };
+                this.proposalDrafts.set(draftKey, nextDraft);
                 await this.answerCallbackQuery(callback.id);
-                if (Number.isFinite(messageId) && messageId > 0) {
-                    await this.editMessageText(chatId, messageId, this.buildProposalCardText({
-                        symbol: String(proposal.symbol || "TOKEN"),
-                        timeframe: String(proposal.timeframe || "1H"),
-                        side: String(proposal.side || "LONG"),
-                        rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
-                        confidencePct: Math.round(Number(proposal.confidence || 0) * 100),
-                        entry: Number(proposal.entry || 0),
-                        tp: Number(proposal.tp || 0),
-                        sl: Number(proposal.sl || 0),
-                        availableUsd,
-                        marginPct: collateralPct,
-                        marginUsd: collateralUsd,
-                        leverage,
-                        maxLeverage,
-                    }), {
-                        inlineKeyboard: this.buildPacificaTradeKeyboard({
-                            proposalId,
-                            marginPct: collateralPct,
-                            leverage,
-                            maxLeverage,
-                        }),
-                    });
-                }
+                await this.replaceProposalCard(chatId, nextDraft);
                 return;
             }
 
