@@ -48,6 +48,13 @@ function describeError(error: unknown) {
     return String(error ?? "unknown error");
 }
 
+function formatUsdCompact(value: number) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric))
+        return "0.00";
+    return numeric.toFixed(Math.abs(numeric) >= 100 ? 2 : 4);
+}
+
 export class TelegramAirificaClient {
     private runtime: IAgentRuntime;
     private running = false;
@@ -243,17 +250,25 @@ export class TelegramAirificaClient {
         }
 
         const link = status?.link || null;
+        const summary = status?.summary || null;
         const linked = Boolean(link);
         const lines = linked
             ? [
                 "Airifica Telegram control surface.",
                 "",
                 `Wallet: ${link.walletAddress}`,
+                summary ? `Equity: ${formatUsdCompact(summary.equityUsd)} USD` : null,
+                summary ? `Available: ${formatUsdCompact(summary.availableUsd)} USD` : null,
+                summary ? `Open positions: ${summary.positionsCount}` : null,
+                summary ? `PnL: ${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD` : null,
                 `Alerts: ${link.alertsEnabled ? "on" : "off"}`,
                 `Conversation: ${link.conversationalEnabled ? "on" : "off"}`,
+                summary?.latestTrade
+                    ? `Last trade: ${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`
+                    : null,
                 "",
                 "Use the buttons below or send a natural-language message.",
-            ]
+            ].filter(Boolean) as string[]
             : [
                 "Airifica Telegram control surface.",
                 "",
@@ -389,12 +404,48 @@ export class TelegramAirificaClient {
                 await this.sendHome(chatId);
                 return true;
             }
+            const summary = status.summary || null;
             await this.sendMessage(chatId, compact([
                 `Linked wallet: ${status.link.walletAddress}`,
+                summary ? `Equity: ${formatUsdCompact(summary.equityUsd)} USD` : null,
+                summary ? `Available: ${formatUsdCompact(summary.availableUsd)} USD` : null,
+                summary ? `Withdrawable: ${formatUsdCompact(summary.withdrawableUsd)} USD` : null,
+                summary ? `Open positions: ${summary.positionsCount}` : null,
+                summary ? `PnL: ${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD` : null,
+                summary?.latestTrade
+                    ? `Last trade: ${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`
+                    : "Last trade: none",
                 `Alerts: ${status.link.alertsEnabled ? "on" : "off"}`,
                 `Conversation: ${status.link.conversationalEnabled ? "on" : "off"}`,
+            ].filter(Boolean).join("\n")), {
+                inlineKeyboard: this.buildStatusKeyboard(status.link),
+            });
+            return true;
+        }
+
+        if (parsed.command === "account" || parsed.command === "pnl") {
+            const status = await this.getLinkStatus(chatId);
+            if (!status.link) {
+                await this.sendHome(chatId);
+                return true;
+            }
+            const summary = status.summary || null;
+            if (!summary) {
+                await this.sendMessage(chatId, "Account snapshot is unavailable right now.");
+                return true;
+            }
+            await this.sendMessage(chatId, compact([
+                `Wallet: ${status.link.walletAddress}`,
+                `Equity: ${formatUsdCompact(summary.equityUsd)} USD`,
+                `Available: ${formatUsdCompact(summary.availableUsd)} USD`,
+                `Withdrawable: ${formatUsdCompact(summary.withdrawableUsd)} USD`,
+                `Open positions: ${summary.positionsCount}`,
+                `PnL: ${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD`,
+                summary.latestTrade
+                    ? `Last trade: ${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`
+                    : "Last trade: none",
             ].join("\n")), {
-                inlineKeyboard: this.buildHomeKeyboard(true, Boolean(status.link.alertsEnabled)),
+                inlineKeyboard: this.buildStatusKeyboard(status.link),
             });
             return true;
         }
@@ -546,11 +597,19 @@ export class TelegramAirificaClient {
                     await this.sendHome(chatId);
                     return;
                 }
+                const summary = status.summary || null;
                 await this.sendMessage(chatId, compact([
                     `Linked wallet: ${status.link.walletAddress}`,
+                    summary ? `Equity: ${formatUsdCompact(summary.equityUsd)} USD` : null,
+                    summary ? `Available: ${formatUsdCompact(summary.availableUsd)} USD` : null,
+                    summary ? `Open positions: ${summary.positionsCount}` : null,
+                    summary ? `PnL: ${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD` : null,
+                    summary?.latestTrade
+                        ? `Last trade: ${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`
+                        : null,
                     `Alerts: ${status.link.alertsEnabled ? "on" : "off"}`,
                     `Conversation: ${status.link.conversationalEnabled ? "on" : "off"}`,
-                ].join("\n")), {
+                ].filter(Boolean).join("\n")), {
                     inlineKeyboard: this.buildStatusKeyboard(status.link),
                 });
                 return;
@@ -700,6 +759,7 @@ export class TelegramAirificaClient {
                 { command: "start", description: "Open the Airifica Telegram home" },
                 { command: "positions", description: "View open Pacifica positions" },
                 { command: "status", description: "Show linked wallet and bot status" },
+                { command: "account", description: "Show account funds, PnL and last trade" },
                 { command: "alerts", description: "Toggle Telegram alerts on or off" },
                 { command: "chat", description: "Enable or disable conversational replies" },
                 { command: "close", description: "Close an open Pacifica position" },
