@@ -682,7 +682,12 @@ export class TelegramAirificaClient {
             const symbol = parsed.args[0]?.toUpperCase();
             const side = parsed.args[1]?.toUpperCase();
             if (!symbol) {
-                await this.sendMessage(chatId, "Usage: /close SYMBOL [LONG|SHORT]");
+                await this.sendMessage(chatId, "Use the close buttons inside Positions.", {
+                    inlineKeyboard: [[
+                        { text: "Open positions", callback_data: "nav:positions" },
+                        { text: "Home", callback_data: "nav:home" },
+                    ]],
+                });
                 return true;
             }
 
@@ -1008,7 +1013,6 @@ export class TelegramAirificaClient {
                 { command: "account", description: "Show account funds, PnL and last trade" },
                 { command: "alerts", description: "Toggle Telegram alerts on or off" },
                 { command: "chat", description: "Enable or disable conversational replies" },
-                { command: "close", description: "Close an open Pacifica position" },
                 { command: "unlink", description: "Unlink this Telegram chat from Airifica" },
             ]);
         } catch (error) {
