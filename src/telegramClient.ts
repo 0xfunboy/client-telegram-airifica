@@ -336,8 +336,9 @@ export class TelegramAirificaClient {
         leverage: number;
         maxLeverage: number;
     }) {
-        const marginUsd = Math.max(0, Number.isFinite(Number(input.marginUsd))
-            ? Number(input.marginUsd)
+        const explicitMarginUsd = input.marginUsd == null ? null : Number(input.marginUsd);
+        const marginUsd = Math.max(0, Number.isFinite(explicitMarginUsd)
+            ? Number(explicitMarginUsd)
             : input.marginPct != null
                 ? input.availableUsd * (input.marginPct / 100)
                 : 0);
