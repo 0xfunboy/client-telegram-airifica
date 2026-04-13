@@ -74,6 +74,11 @@ function escapeHtml(value: unknown) {
         .replace(/>/g, "&gt;");
 }
 
+function shortText(value: unknown, maxLength = 180) {
+    const text = String(value ?? "").trim().replace(/\s+/g, " ");
+    return text.length > maxLength ? `${text.slice(0, maxLength - 1)}…` : text;
+}
+
 function formatUsdCompact(value: number) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric))
@@ -174,8 +179,12 @@ export class TelegramAirificaClient {
         });
         const raw = await response.text();
         const payload = raw ? JSON.parse(raw) as T & { ok?: boolean; error?: string } : null;
-        if (!response.ok || (payload && typeof payload === "object" && payload.ok === false))
-            throw new Error((payload as any)?.error || `Internal API ${pathname} failed`);
+        if (!response.ok || (payload && typeof payload === "object" && payload.ok === false)) {
+            const error: any = new Error((payload as any)?.error || `Internal API ${pathname} failed`);
+            error.statusCode = response.status;
+            error.payload = payload;
+            throw error;
+        }
         return payload as T;
     }
 
@@ -247,6 +256,14 @@ export class TelegramAirificaClient {
             };
         }
         await this.telegramApi("editMessageText", payload);
+    }
+
+    private async sendOrEditMessage(chatId: string, messageId: number | undefined, text: string, options?: TelegramMessageOptions) {
+        if (Number.isFinite(messageId) && Number(messageId) > 0) {
+            await this.editMessageText(chatId, Number(messageId), text, options);
+            return;
+        }
+        await this.sendMessage(chatId, text, options);
     }
 
     private async answerCallbackQuery(callbackQueryId: string, text?: string) {
@@ -419,7 +436,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         });
     }
 
-    private buildHomeKeyboard(linked: boolean, alertsEnabled = true) {
+    private buildHomeKeyboard(linked: boolean, alertsEnabled = true, conversationalEnabled = true) {
         const keyboard: Array<Array<TelegramInlineButton>> = [];
         const connectWebUrl = this.getConnectWebUrl();
         const botUrl = this.getBotUrl();
@@ -434,16 +451,16 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             ]);
         }
 
-        keyboard.push([
-            { text: "Positions", callback_data: "nav:positions" },
-            { text: "Status", callback_data: "nav:status" },
-        ]);
-
         if (linked) {
             keyboard.push([
-                { text: alertsEnabled ? "Alerts: on" : "Alerts: off", callback_data: alertsEnabled ? "alerts:off" : "alerts:on" },
-                { text: "Chat settings", callback_data: "nav:status" },
+                { text: "Positions", callback_data: "nav:positions" },
+                { text: "Refresh", callback_data: "nav:home" },
             ]);
+            keyboard.push([
+                { text: alertsEnabled ? "Alerts: on" : "Alerts: off", callback_data: alertsEnabled ? "alerts:off" : "alerts:on" },
+                { text: conversationalEnabled ? "Chat: on" : "Chat: off", callback_data: conversationalEnabled ? "chat:off" : "chat:on" },
+            ]);
+        } else {
             keyboard.push([
                 { text: "Refresh", callback_data: "nav:home" },
             ]);
@@ -474,7 +491,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ];
     }
 
-    private async sendHome(chatId: string) {
+    private async sendHome(chatId: string, messageId?: number) {
         let status: any = null;
         try {
             status = await this.getLinkStatus(chatId);
@@ -510,13 +527,13 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 "Manual fallback: /link CODE",
             ];
 
-        await this.sendMessage(chatId, compact([
+        await this.sendOrEditMessage(chatId, messageId, compact([
             "<b>Airifica Telegram</b>",
             "",
             ...lines,
         ].join("\n")), {
             parseMode: "HTML",
-            inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled)),
+            inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled), Boolean(link?.conversationalEnabled)),
         });
     }
 
@@ -533,7 +550,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         };
     }
 
-    private async renderPositions(chatId: string) {
+    private async renderPositions(chatId: string, messageId?: number) {
         const payload = await this.internalApi<any>("/api/airi3/telegram/internal/positions", {
             method: "POST",
             body: JSON.stringify({ chatId }),
@@ -565,7 +582,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             },
         ]));
 
-        await this.sendMessage(chatId, compact([
+        await this.sendOrEditMessage(chatId, messageId, compact([
             "<b>Open positions</b>",
             "",
             ...lines,
@@ -579,6 +596,57 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 ],
             ],
         });
+    }
+
+    private async renderStatus(chatId: string, messageId?: number) {
+        const status = await this.getLinkStatus(chatId);
+        if (!status.link) {
+            await this.sendHome(chatId, messageId);
+            return;
+        }
+        const summary = status.summary || null;
+        await this.sendOrEditMessage(chatId, messageId, compact([
+            "<b>Account status</b>",
+            "",
+            `Linked wallet: <code>${escapeHtml(status.link.walletAddress)}</code>`,
+            summary ? `Equity: <code>${escapeHtml(`${formatUsdCompact(summary.equityUsd)} USD`)}</code>` : null,
+            summary ? `Available: <code>${escapeHtml(`${formatUsdCompact(summary.availableUsd)} USD`)}</code>` : null,
+            summary ? `Withdrawable: <code>${escapeHtml(`${formatUsdCompact(summary.withdrawableUsd)} USD`)}</code>` : null,
+            summary ? `Open positions: <code>${escapeHtml(summary.positionsCount)}</code>` : null,
+            summary ? `PnL: <code>${escapeHtml(`${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD`)}</code>` : null,
+            summary?.latestTrade
+                ? `Last trade: <code>${escapeHtml(`${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`)}</code>`
+                : "Last trade: <i>none</i>",
+            `Alerts: <code>${escapeHtml(status.link.alertsEnabled ? "on" : "off")}</code>`,
+            `Conversation: <code>${escapeHtml(status.link.conversationalEnabled ? "on" : "off")}</code>`,
+        ].filter(Boolean).join("\n")), {
+            parseMode: "HTML",
+            inlineKeyboard: this.buildStatusKeyboard(status.link),
+        });
+    }
+
+    private formatActionError(error: any) {
+        const payload = error?.payload && typeof error.payload === "object" ? error.payload : null;
+        const rawError = String(payload?.error || error?.message || "Action failed").trim();
+        const rawHint = String(payload?.hint || "").trim();
+        if (/requires at least .* usd notional/i.test(rawError) || /too small for lot/i.test(rawError)) {
+            const detail = rawHint || rawError;
+            return compact([
+                "<b>Trade not opened</b>",
+                "",
+                "<i>Selected size is too small for this market.</i>",
+                `<code>${escapeHtml(detail)}</code>`,
+                "",
+                "Increase <b>Collateral</b>, raise <b>Leverage</b>, or use a larger preset before pressing <b>Execute</b> again.",
+            ].join("\n"));
+        }
+
+        return compact([
+            "<b>Action failed</b>",
+            "",
+            `<code>${escapeHtml(rawError)}</code>`,
+            rawHint ? `<i>${escapeHtml(rawHint)}</i>` : null,
+        ].filter(Boolean).join("\n"));
     }
 
     private async renderPositionDetail(chatId: string, symbol: string, side: string, messageId?: number) {
@@ -717,7 +785,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     }),
                 });
                 await this.sendMessage(chatId, `Linked to wallet ${linkResult.link.walletAddress}. Alerts are on and chat is ready.`, {
-                    inlineKeyboard: this.buildHomeKeyboard(true, Boolean(linkResult.link.alertsEnabled)),
+                    inlineKeyboard: this.buildHomeKeyboard(true, Boolean(linkResult.link.alertsEnabled), Boolean(linkResult.link.conversationalEnabled)),
                 });
                 return true;
             }
@@ -752,33 +820,13 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 }),
             });
             await this.sendMessage(chatId, `Linked to wallet ${linkResult.link.walletAddress}.`, {
-                inlineKeyboard: this.buildHomeKeyboard(true, Boolean(linkResult.link.alertsEnabled)),
+                inlineKeyboard: this.buildHomeKeyboard(true, Boolean(linkResult.link.alertsEnabled), Boolean(linkResult.link.conversationalEnabled)),
             });
             return true;
         }
 
         if (parsed.command === "status") {
-            const status = await this.getLinkStatus(chatId);
-            if (!status.link) {
-                await this.sendHome(chatId);
-                return true;
-            }
-            const summary = status.summary || null;
-            await this.sendMessage(chatId, compact([
-                `Linked wallet: ${status.link.walletAddress}`,
-                summary ? `Equity: ${formatUsdCompact(summary.equityUsd)} USD` : null,
-                summary ? `Available: ${formatUsdCompact(summary.availableUsd)} USD` : null,
-                summary ? `Withdrawable: ${formatUsdCompact(summary.withdrawableUsd)} USD` : null,
-                summary ? `Open positions: ${summary.positionsCount}` : null,
-                summary ? `PnL: ${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD` : null,
-                summary?.latestTrade
-                    ? `Last trade: ${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`
-                    : "Last trade: none",
-                `Alerts: ${status.link.alertsEnabled ? "on" : "off"}`,
-                `Conversation: ${status.link.conversationalEnabled ? "on" : "off"}`,
-            ].filter(Boolean).join("\n")), {
-                inlineKeyboard: this.buildStatusKeyboard(status.link),
-            });
+            await this.renderStatus(chatId);
             return true;
         }
 
@@ -998,38 +1046,19 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
         try {
             if (data === "nav:home") {
                 await this.answerCallbackQuery(callback.id);
-                await this.sendHome(chatId);
+                await this.sendHome(chatId, messageId);
                 return;
             }
 
             if (data === "nav:positions") {
                 await this.answerCallbackQuery(callback.id);
-                await this.renderPositions(chatId);
+                await this.renderPositions(chatId, messageId);
                 return;
             }
 
             if (data === "nav:status") {
-                const status = await this.getLinkStatus(chatId);
                 await this.answerCallbackQuery(callback.id);
-                if (!status.link) {
-                    await this.sendHome(chatId);
-                    return;
-                }
-                const summary = status.summary || null;
-                await this.sendMessage(chatId, compact([
-                    `Linked wallet: ${status.link.walletAddress}`,
-                    summary ? `Equity: ${formatUsdCompact(summary.equityUsd)} USD` : null,
-                    summary ? `Available: ${formatUsdCompact(summary.availableUsd)} USD` : null,
-                    summary ? `Open positions: ${summary.positionsCount}` : null,
-                    summary ? `PnL: ${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD` : null,
-                    summary?.latestTrade
-                        ? `Last trade: ${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`
-                        : null,
-                    `Alerts: ${status.link.alertsEnabled ? "on" : "off"}`,
-                    `Conversation: ${status.link.conversationalEnabled ? "on" : "off"}`,
-                ].filter(Boolean).join("\n")), {
-                    inlineKeyboard: this.buildStatusKeyboard(status.link),
-                });
+                await this.renderStatus(chatId, messageId);
                 return;
             }
 
@@ -1040,7 +1069,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     body: JSON.stringify({ chatId, enabled }),
                 });
                 await this.answerCallbackQuery(callback.id, enabled ? "Alerts enabled" : "Alerts disabled");
-                await this.sendHome(chatId);
+                await this.sendHome(chatId, messageId);
                 return;
             }
 
@@ -1057,7 +1086,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     body: JSON.stringify({ chatId, enabled }),
                 });
                 await this.answerCallbackQuery(callback.id, enabled ? "Conversation enabled" : "Conversation disabled");
-                await this.sendHome(chatId);
+                await this.sendHome(chatId, messageId);
                 return;
             }
 
@@ -1072,9 +1101,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     }),
                 });
                 await this.answerCallbackQuery(callback.id, `Closed ${result.closed.symbol}`);
-                await this.sendMessage(chatId, `Closed ${result.closed.side} ${result.closed.symbol} (${result.closed.amount}).`, {
-                    inlineKeyboard: this.buildHomeKeyboard(true),
-                });
+                await this.renderPositions(chatId, messageId);
                 return;
             }
 
@@ -1110,9 +1137,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     }),
                 });
                 await this.answerCallbackQuery(callback.id, `Closed ${pct}%`);
-                await this.sendMessage(chatId, `Closed ${pct}% of ${result.closed.side} ${result.closed.symbol} (${formatNumberCompact(Number(result.closed.amount || 0), 6)}).`, {
-                    inlineKeyboard: this.buildHomeKeyboard(true),
-                });
+                await this.renderPositions(chatId, messageId);
                 return;
             }
 
@@ -1152,11 +1177,21 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                         }),
                     });
                     await this.answerCallbackQuery(callback.id, "Trade executed");
-                    await this.sendMessage(
-                        chatId,
-                        `Opened ${result.side} ${result.symbol} with ${formatUsdCompact(result.marginUsd)} USD at ${result.leverage}x${result.orderId ? ` (${result.orderId})` : ""}.`,
-                        { inlineKeyboard: this.buildHomeKeyboard(true) },
-                    );
+                    const successText = compact([
+                        "<b>Trade opened</b>",
+                        "",
+                        `<code>${escapeHtml(`${result.side} ${result.symbol}`)}</code>`,
+                        `<i>Collateral</i> <code>${escapeHtml(`${formatUsdCompact(result.marginUsd)} USD`)}</code>`,
+                        `<i>Leverage</i> <code>${escapeHtml(`${result.leverage}x`)}</code>`,
+                        result.orderId ? `<i>Order</i> <code>${escapeHtml(result.orderId)}</code>` : null,
+                    ].filter(Boolean).join("\n"));
+                    await this.sendOrEditMessage(chatId, messageId, successText, {
+                        parseMode: "HTML",
+                        inlineKeyboard: [[
+                            { text: "Positions", callback_data: "nav:positions" },
+                            { text: "Home", callback_data: "nav:home" },
+                        ]],
+                    });
                     this.proposalDrafts.delete(draftKey);
                     this.pendingCollateralInputs.delete(chatId);
                     return;
@@ -1199,7 +1234,15 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
             await this.answerCallbackQuery(callback.id, "Unsupported action.");
         } catch (error: any) {
-            await this.answerCallbackQuery(callback.id, error?.message || "Action failed");
+            const brief = shortText(error?.payload?.error || error?.message || "Action failed", 120);
+            await this.answerCallbackQuery(callback.id, brief);
+            await this.sendMessage(chatId, this.formatActionError(error), {
+                parseMode: "HTML",
+                inlineKeyboard: [[
+                    { text: "Home", callback_data: "nav:home" },
+                    { text: "Positions", callback_data: "nav:positions" },
+                ]],
+            });
         }
     }
 
