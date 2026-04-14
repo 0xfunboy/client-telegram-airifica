@@ -128,6 +128,7 @@ export class TelegramAirificaClient {
     private readonly proposalDrafts = new Map<string, TelegramProposalDraft>();
     private readonly pendingCollateralInputs = new Map<string, { proposalId: number }>();
     private readonly pendingActionInputs = new Map<string, PendingActionRequest>();
+    private readonly panelMessageIds = new Map<string, number>();
     private heartbeatTimer: NodeJS.Timeout | null = null;
 
     constructor(runtime: IAgentRuntime) {
@@ -311,20 +312,35 @@ export class TelegramAirificaClient {
             };
         }
         await this.telegramApi("editMessageText", payload);
+        return messageId;
     }
 
     private async sendOrEditMessage(chatId: string, messageId: number | undefined, text: string, options?: TelegramMessageOptions) {
         if (Number.isFinite(messageId) && Number(messageId) > 0) {
             try {
-                await this.editMessageText(chatId, Number(messageId), text, options);
+                return await this.editMessageText(chatId, Number(messageId), text, options);
             } catch (error) {
                 if (/message is not modified/i.test(describeError(error)))
-                    return;
+                    return Number(messageId);
                 throw error;
             }
-            return;
         }
-        await this.sendMessage(chatId, text, options);
+        const sent = await this.sendMessage(chatId, text, options);
+        return Number(sent?.message_id || 0);
+    }
+
+    private resolvePanelMessageId(chatId: string, messageId?: number) {
+        if (Number.isFinite(messageId) && Number(messageId) > 0)
+            return Number(messageId);
+        const stored = this.panelMessageIds.get(chatId);
+        return Number.isFinite(stored) && Number(stored) > 0 ? Number(stored) : undefined;
+    }
+
+    private async sendPanelMessage(chatId: string, text: string, options?: TelegramMessageOptions, messageId?: number) {
+        const nextMessageId = await this.sendOrEditMessage(chatId, this.resolvePanelMessageId(chatId, messageId), text, options);
+        if (Number.isFinite(nextMessageId) && Number(nextMessageId) > 0)
+            this.panelMessageIds.set(chatId, Number(nextMessageId));
+        return nextMessageId;
     }
 
     private async answerCallbackQuery(callbackQueryId: string, text?: string) {
@@ -365,6 +381,7 @@ export class TelegramAirificaClient {
         proposal: any;
         sizeUsd?: number | null;
         venue?: string | null;
+        proposalId?: number | null;
     }) {
         if (!this.publicAppUrl)
             return "";
@@ -382,6 +399,9 @@ export class TelegramAirificaClient {
         url.searchParams.set("confidence", String(Number(input.proposal?.confidence || 0)));
         if (input.venue)
             url.searchParams.set("venue", String(input.venue).trim());
+        const proposalId = Number(input.proposalId);
+        if (Number.isFinite(proposalId) && proposalId > 0)
+            url.searchParams.set("proposalId", String(proposalId));
         const sizeUsd = Number(input.sizeUsd);
         if (Number.isFinite(sizeUsd) && sizeUsd > 0)
             url.searchParams.set("sizeUsd", String(sizeUsd));
@@ -520,7 +540,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             `<b>Quantity</b> <code>${escapeHtml(`${formatNumberCompact(quantity, 6)} ${input.symbol}`)}</code>`,
             `<b>Position size</b> <code>${escapeHtml(`${formatUsdCompact(sizeUsd)} USD`)}</code>`,
             "",
-            "<i>Open Airifica to sign the swap with Phantom and execute on Jupiter.</i>",
+            "<i>Entry, take profit and stop loss are analysis levels only. Open Airifica to sign the Jupiter swap with Phantom.</i>",
         ].join("\n"));
     }
 
@@ -574,6 +594,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                     proposalId: draft.proposalId,
                     selectedUsd: selectedSpotUsd > 0 ? selectedSpotUsd : null,
                     openUrl: this.getAirificaProposalUrl({
+                        proposalId: draft.proposalId,
                         marketQuery: draft.marketQuery || draft.baseTokenAddress || String(proposal.symbol || ""),
                         proposal,
                         sizeUsd: selectedSpotUsd,
@@ -771,14 +792,14 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 "Fallback: <code>/link CODE</code>",
             ];
 
-        await this.sendOrEditMessage(chatId, messageId, compact([
+        await this.sendPanelMessage(chatId, compact([
             "<b>Airifica</b>",
             "",
             ...lines,
         ].join("\n")), {
             parseMode: "HTML",
             inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled), Boolean(link?.conversationalEnabled)),
-        });
+        }, messageId);
     }
 
     private async renderHelp(chatId: string, messageId?: number) {
@@ -788,7 +809,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         } catch {
         }
         const linked = Boolean(status?.link);
-        await this.sendOrEditMessage(chatId, messageId, compact([
+        await this.sendPanelMessage(chatId, compact([
             "<b>Help</b>",
             "",
             "<b>What this bot can do</b>",
@@ -813,11 +834,11 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ].join("\n")), {
             parseMode: "HTML",
             inlineKeyboard: this.buildHelpKeyboard(linked),
-        });
+        }, messageId);
     }
 
     private async renderActions(chatId: string, messageId?: number) {
-        await this.sendOrEditMessage(chatId, messageId, compact([
+        await this.sendPanelMessage(chatId, compact([
             "<b>Actions</b>",
             "",
             "Choose a guided action below.",
@@ -827,7 +848,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ].join("\n")), {
             parseMode: "HTML",
             inlineKeyboard: this.buildActionsKeyboard(),
-        });
+        }, messageId);
     }
 
     private parseCommand(text: string) {
@@ -891,7 +912,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             },
         ]));
 
-        await this.sendOrEditMessage(chatId, messageId, compact([
+        await this.sendPanelMessage(chatId, compact([
             "<b>Open positions</b>",
             "",
             ...lines,
@@ -904,42 +925,11 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                     { text: "Home", callback_data: "nav:home" },
                 ],
             ],
-        });
+        }, messageId);
     }
 
     private async renderStatus(chatId: string, messageId?: number) {
-        const status = await this.getLinkStatus(chatId);
-        if (!status.link) {
-            await this.sendHome(chatId, messageId);
-            return;
-        }
-        const summary = status.summary || null;
-        await this.sendOrEditMessage(chatId, messageId, compact([
-            "<b>Account</b>",
-            "",
-            `Wallet <code>${escapeHtml(shortWallet(status.link.walletAddress))}</code>`,
-            summary ? `Equity: <code>${escapeHtml(`${formatUsdCompact(summary.equityUsd)} USD`)}</code>` : null,
-            summary ? `Available: <code>${escapeHtml(`${formatUsdCompact(summary.availableUsd)} USD`)}</code>` : null,
-            summary ? `Withdrawable: <code>${escapeHtml(`${formatUsdCompact(summary.withdrawableUsd)} USD`)}</code>` : null,
-            summary ? `Open positions: <code>${escapeHtml(summary.positionsCount)}</code>` : null,
-            summary ? `Spot holdings: <code>${escapeHtml(summary.onchainPositionsCount || 0)}</code>` : null,
-            summary ? `PnL: <code>${escapeHtml(`${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD`)}</code>` : null,
-            summary && Number(summary.onchainValueUsd || 0) > 0
-                ? `Spot value: <code>${escapeHtml(`${formatUsdCompact(summary.onchainValueUsd)} USD`)}</code>`
-                : null,
-            summary?.latestTrade
-                ? `Last trade: <code>${escapeHtml(`${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`)}</code>`
-                : "Last trade: <i>none</i>",
-            `Alerts: <code>${escapeHtml(status.link.alertsEnabled ? "on" : "off")}</code>`,
-            `Conversation: <code>${escapeHtml(status.link.conversationalEnabled ? "on" : "off")}</code>`,
-        ].filter(Boolean).join("\n")), {
-            parseMode: "HTML",
-            inlineKeyboard: [[
-                { text: "Positions", callback_data: "nav:positions" },
-                { text: "Actions", callback_data: "nav:actions" },
-                { text: "Home", callback_data: "nav:home" },
-            ]],
-        });
+        await this.sendHome(chatId, messageId);
     }
 
     private formatActionError(error: any) {
@@ -1033,6 +1023,46 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             parseMode: "HTML",
             inlineKeyboard: keyboard,
         });
+    }
+
+    private buildSpotExecutionCompletedText(alert: any, draft: TelegramProposalDraft) {
+        const symbol = String(alert?.meta?.symbol || draft.proposal?.symbol || "TOKEN").trim() || "TOKEN";
+        const txSignature = String(alert?.meta?.txSignature || "").trim();
+        const lines = [
+            "<b>Spot trade opened</b>",
+            "",
+            `<code>${escapeHtml(`LONG ${symbol} via Jupiter`)}</code>`,
+            draft.collateralUsd != null
+                ? `<i>Budget</i> <code>${escapeHtml(`${formatUsdCompact(Number(draft.collateralUsd || 0))} USD`)}</code>`
+                : null,
+            txSignature ? `<i>Tx</i> <code>${escapeHtml(shortWallet(txSignature))}</code>` : null,
+            "<i>TP/SL levels remain analytical and were not placed onchain.</i>",
+        ];
+
+        return compact(lines.filter(Boolean).join("\n"));
+    }
+
+    private async settleSpotProposalFromAlert(alert: any) {
+        const chatId = String(alert?.chatId || "").trim();
+        const proposalId = Number(alert?.meta?.proposalId);
+        if (!chatId || !Number.isFinite(proposalId) || proposalId <= 0)
+            return false;
+
+        const draftKey = this.getDraftKey(chatId, proposalId);
+        const draft = this.proposalDrafts.get(draftKey);
+        if (!draft || draft.kind !== "spot" || !Number.isFinite(draft.messageId) || draft.messageId <= 0)
+            return false;
+
+        await this.sendOrEditMessage(chatId, draft.messageId, this.buildSpotExecutionCompletedText(alert, draft), {
+            parseMode: "HTML",
+            inlineKeyboard: [[
+                { text: "Positions", callback_data: "nav:positions" },
+                { text: "Home", callback_data: "nav:home" },
+            ]],
+        });
+        this.proposalDrafts.delete(draftKey);
+        this.pendingCollateralInputs.delete(chatId);
+        return true;
     }
 
     private async sendProposalCard(chatId: string, sourceText: string, proposal: any) {
@@ -1158,12 +1188,12 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
         }
 
         if (parsed.command === "status") {
-            await this.renderStatus(chatId);
+            await this.sendHome(chatId);
             return true;
         }
 
         if (parsed.command === "account" || parsed.command === "pnl") {
-            await this.renderStatus(chatId);
+            await this.sendHome(chatId);
             return true;
         }
 
@@ -1177,9 +1207,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 method: "POST",
                 body: JSON.stringify({ chatId, enabled: value === "on" }),
             });
-            await this.sendMessage(chatId, `Alerts ${value === "on" ? "enabled" : "disabled"}.`, {
-                inlineKeyboard: this.buildHomeKeyboard(true, value === "on"),
-            });
+            await this.sendHome(chatId);
             return true;
         }
 
@@ -1196,9 +1224,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     enabled: value === "on",
                 }),
             });
-            await this.sendMessage(chatId, `Telegram conversation ${value === "on" ? "enabled" : "disabled"}.`, {
-                inlineKeyboard: this.buildHomeKeyboard(true),
-            });
+            await this.sendHome(chatId);
             return true;
         }
 
@@ -1373,19 +1399,19 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
         try {
             if (data === "nav:home") {
-                await this.answerCallbackQuery(callback.id, "Up to date");
+                await this.answerCallbackQuery(callback.id);
                 await this.sendHome(chatId, messageId);
                 return;
             }
 
             if (data === "nav:positions") {
-                await this.answerCallbackQuery(callback.id, "Updated");
+                await this.answerCallbackQuery(callback.id);
                 await this.renderPositions(chatId, messageId);
                 return;
             }
 
             if (data === "nav:status") {
-                await this.answerCallbackQuery(callback.id, "Updated");
+                await this.answerCallbackQuery(callback.id);
                 await this.renderStatus(chatId, messageId);
                 return;
             }
@@ -1651,7 +1677,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             await this.answerCallbackQuery(callback.id, "Unsupported action.");
         } catch (error: any) {
             if (/message is not modified/i.test(describeError(error))) {
-                await this.answerCallbackQuery(callback.id, "Up to date");
+                await this.answerCallbackQuery(callback.id);
                 return;
             }
             const brief = shortText(error?.payload?.error || error?.message || "Action failed", 120);
@@ -1722,7 +1748,9 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 const alerts = Array.isArray(payload.alerts) ? payload.alerts : [];
                 for (const alert of alerts) {
                     try {
-                        await this.sendMessage(String(alert.chatId), String(alert.text || ""));
+                        const handledInline = await this.settleSpotProposalFromAlert(alert);
+                        if (!handledInline)
+                            await this.sendMessage(String(alert.chatId), String(alert.text || ""));
                         await this.internalApi(`/api/airi3/telegram/internal/alerts/${alert.id}/delivered`, {
                             method: "POST",
                             body: JSON.stringify({}),
