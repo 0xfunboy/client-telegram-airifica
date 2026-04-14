@@ -113,7 +113,7 @@ function formatUsdCompact(value: number) {
     if (absolute === 0)
         return "0.00";
 
-    const decimals = Math.min(8, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 1));
+    const decimals = Math.min(6, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 2));
     return numeric.toLocaleString("en-US", {
         minimumFractionDigits: 0,
         maximumFractionDigits: decimals,
@@ -135,7 +135,7 @@ function formatNumberCompact(value: number, decimals = 4) {
         return "0";
     const maxFractionDigits = absolute >= 1
         ? Math.min(4, Math.max(0, decimals))
-        : Math.min(8, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 1));
+        : Math.min(6, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 2));
     return numeric.toLocaleString("en-US", {
         minimumFractionDigits: 0,
         maximumFractionDigits: maxFractionDigits,
