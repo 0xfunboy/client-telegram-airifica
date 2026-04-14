@@ -37,6 +37,7 @@ type TelegramBotCommand = {
 };
 
 type TelegramProposalDraft = {
+    kind: "pacifica" | "spot";
     chatId: string;
     proposalId: number;
     messageId: number;
@@ -45,6 +46,8 @@ type TelegramProposalDraft = {
     leverage: number;
     collateralPct: number | null;
     collateralUsd: number | null;
+    baseTokenAddress?: string | null;
+    marketQuery?: string | null;
     proposal: any;
 };
 
@@ -357,6 +360,34 @@ export class TelegramAirificaClient {
         return `https://jup.ag/swap/SOL-${resolvedMint}`;
     }
 
+    private getAirificaProposalUrl(input: {
+        marketQuery: string;
+        proposal: any;
+        sizeUsd?: number | null;
+        venue?: string | null;
+    }) {
+        if (!this.publicAppUrl)
+            return "";
+
+        const url = new URL(this.publicAppUrl);
+        url.searchParams.set("source", "telegram_bot");
+        url.searchParams.set("tgTrade", "1");
+        url.searchParams.set("query", String(input.marketQuery || input.proposal?.symbol || "").trim());
+        url.searchParams.set("symbol", String(input.proposal?.symbol || "").trim());
+        url.searchParams.set("side", String(input.proposal?.side || "LONG").trim());
+        url.searchParams.set("entry", String(Number(input.proposal?.entry || 0)));
+        url.searchParams.set("tp", String(Number(input.proposal?.tp || 0)));
+        url.searchParams.set("sl", String(Number(input.proposal?.sl || 0)));
+        url.searchParams.set("timeframe", String(input.proposal?.timeframe || "1H").trim());
+        url.searchParams.set("confidence", String(Number(input.proposal?.confidence || 0)));
+        if (input.venue)
+            url.searchParams.set("venue", String(input.venue).trim());
+        const sizeUsd = Number(input.sizeUsd);
+        if (Number.isFinite(sizeUsd) && sizeUsd > 0)
+            url.searchParams.set("sizeUsd", String(sizeUsd));
+        return url.toString();
+    }
+
     private getDraftKey(chatId: string, proposalId: number) {
         return `${chatId}:${proposalId}`;
     }
@@ -394,6 +425,27 @@ export class TelegramAirificaClient {
                 { text: "Refresh", callback_data: `tgp:r:${draft.proposalId}` },
             ],
         ];
+    }
+
+    private buildSpotTradeKeyboard(draft: {
+        proposalId: number;
+        selectedUsd: number | null;
+        openUrl: string;
+    }) {
+        const spotSizes = [10, 25, 50, 100];
+        const sizeButtons = spotSizes.map((value) => ({
+            text: value === draft.selectedUsd ? `● ${value}$` : `${value}$`,
+            callback_data: `tgp:p:${draft.proposalId}:${value}`,
+        }));
+
+        return [
+            sizeButtons,
+            [
+                { text: "Set USD", callback_data: `tgp:s:${draft.proposalId}` },
+                { text: "Open in Airifica", url: draft.openUrl },
+            ],
+            [{ text: "Refresh", callback_data: `tgp:r:${draft.proposalId}` }],
+        ].filter(row => row.length > 0);
     }
 
     private buildProposalCardText(input: {
@@ -441,26 +493,72 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ].join("\n"));
     }
 
+    private buildSpotProposalCardText(input: {
+        symbol: string;
+        timeframe: string;
+        side: string;
+        rr: number | null;
+        confidencePct: number;
+        entry: number;
+        tp: number;
+        sl: number;
+        sizeUsd: number;
+    }) {
+        const sizeUsd = Math.max(0, Number(input.sizeUsd || 0));
+        const quantity = input.entry > 0 ? sizeUsd / input.entry : 0;
+        const rrText = Number.isFinite(input.rr) && input.rr && input.rr > 0 ? `R/R ${formatNumberCompact(input.rr, 2)}` : "R/R -";
+
+        return compact([
+            `<b>$${escapeHtml(input.symbol)}</b> <i>${escapeHtml(input.timeframe)}</i> <u>${escapeHtml(input.side)}</u>`,
+            `<b>${escapeHtml(rrText)}</b>  <b>Confidence</b> <code>${escapeHtml(`${input.confidencePct}%`)}</code>`,
+            "",
+            `<i>Spot execution handoff</i>`,
+            `<pre>Entry         ${escapeHtml(formatNumberCompact(input.entry, 6))}
+Take profit   ${escapeHtml(formatNumberCompact(input.tp, 6))}
+Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
+            `<b>Budget</b> <code>${escapeHtml(`${formatUsdCompact(sizeUsd)} USD`)}</code>`,
+            `<b>Quantity</b> <code>${escapeHtml(`${formatNumberCompact(quantity, 6)} ${input.symbol}`)}</code>`,
+            `<b>Position size</b> <code>${escapeHtml(`${formatUsdCompact(sizeUsd)} USD`)}</code>`,
+            "",
+            "<i>Open Airifica to sign the swap with Phantom and execute on Jupiter.</i>",
+        ].join("\n"));
+    }
+
     private async replaceProposalCard(chatId: string, draft: TelegramProposalDraft) {
         const proposal = draft.proposal || {};
         const rewardRisk = proposal.side === "LONG"
             ? ((Number(proposal.tp) - Number(proposal.entry)) / Math.max(0.0000001, Number(proposal.entry) - Number(proposal.sl)))
             : ((Number(proposal.entry) - Number(proposal.tp)) / Math.max(0.0000001, Number(proposal.sl) - Number(proposal.entry)));
-        const text = this.buildProposalCardText({
-            symbol: String(proposal.symbol || "TOKEN"),
-            timeframe: String(proposal.timeframe || "1H"),
-            side: String(proposal.side || "LONG"),
-            rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
-            confidencePct: Math.round(Number(proposal.confidence || 0) * 100),
-            entry: Number(proposal.entry || 0),
-            tp: Number(proposal.tp || 0),
-            sl: Number(proposal.sl || 0),
-            availableUsd: draft.availableUsd,
-            marginPct: draft.collateralPct,
-            marginUsd: draft.collateralUsd,
-            leverage: draft.leverage,
-            maxLeverage: draft.maxLeverage,
-        });
+        const selectedSpotUsd = draft.collateralUsd != null
+            ? Number(draft.collateralUsd)
+            : Math.max(0, Number(draft.collateralPct || 0));
+        const text = draft.kind === "spot"
+            ? this.buildSpotProposalCardText({
+                symbol: String(proposal.symbol || "TOKEN"),
+                timeframe: String(proposal.timeframe || "1H"),
+                side: String(proposal.side || "LONG"),
+                rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
+                confidencePct: Math.round(Number(proposal.confidence || 0) * 100),
+                entry: Number(proposal.entry || 0),
+                tp: Number(proposal.tp || 0),
+                sl: Number(proposal.sl || 0),
+                sizeUsd: selectedSpotUsd,
+            })
+            : this.buildProposalCardText({
+                symbol: String(proposal.symbol || "TOKEN"),
+                timeframe: String(proposal.timeframe || "1H"),
+                side: String(proposal.side || "LONG"),
+                rr: Number.isFinite(rewardRisk) ? rewardRisk : null,
+                confidencePct: Math.round(Number(proposal.confidence || 0) * 100),
+                entry: Number(proposal.entry || 0),
+                tp: Number(proposal.tp || 0),
+                sl: Number(proposal.sl || 0),
+                availableUsd: draft.availableUsd,
+                marginPct: draft.collateralPct,
+                marginUsd: draft.collateralUsd,
+                leverage: draft.leverage,
+                maxLeverage: draft.maxLeverage,
+            });
 
         if (draft.messageId > 0) {
             try {
@@ -471,12 +569,23 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
 
         const sent = await this.sendMessage(chatId, text, {
             parseMode: "HTML",
-            inlineKeyboard: this.buildPacificaTradeKeyboard({
-                proposalId: draft.proposalId,
-                marginPct: draft.collateralPct,
-                leverage: draft.leverage,
-                maxLeverage: draft.maxLeverage,
-            }),
+            inlineKeyboard: draft.kind === "spot"
+                ? this.buildSpotTradeKeyboard({
+                    proposalId: draft.proposalId,
+                    selectedUsd: selectedSpotUsd > 0 ? selectedSpotUsd : null,
+                    openUrl: this.getAirificaProposalUrl({
+                        marketQuery: draft.marketQuery || draft.baseTokenAddress || String(proposal.symbol || ""),
+                        proposal,
+                        sizeUsd: selectedSpotUsd,
+                        venue: "jupiter",
+                    }),
+                })
+                : this.buildPacificaTradeKeyboard({
+                    proposalId: draft.proposalId,
+                    marginPct: draft.collateralPct,
+                    leverage: draft.leverage,
+                    maxLeverage: draft.maxLeverage,
+                }),
         });
 
         const nextDraft: TelegramProposalDraft = {
@@ -645,7 +754,11 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 summary ? `Equity <code>${escapeHtml(`${formatUsdCompact(summary.equityUsd)} USD`)}</code>` : null,
                 summary ? `Available <code>${escapeHtml(`${formatUsdCompact(summary.availableUsd)} USD`)}</code>` : null,
                 summary ? `Positions <code>${escapeHtml(summary.positionsCount)}</code>` : null,
+                summary ? `Spot holdings <code>${escapeHtml(summary.onchainPositionsCount || 0)}</code>` : null,
                 summary ? `PnL <code>${escapeHtml(`${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD`)}</code>` : null,
+                summary && Number(summary.onchainValueUsd || 0) > 0
+                    ? `Spot value <code>${escapeHtml(`${formatUsdCompact(summary.onchainValueUsd)} USD`)}</code>`
+                    : null,
                 summary?.latestTrade
                     ? `Last trade <code>${escapeHtml(`${summary.latestTrade.side} ${summary.latestTrade.symbol}`)}</code>`
                     : null,
@@ -738,25 +851,37 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         const overview = payload.overview || {};
         const account = overview.account || {};
         const positions = Array.isArray(overview.positions) ? overview.positions : [];
-        const lines = positions.length
-            ? [
-                `Wallet <code>${escapeHtml(shortWallet(payload.walletAddress))}</code>`,
-                `Open positions <code>${escapeHtml(positions.length)}</code>`,
-            ]
-            : [
-                `Wallet <code>${escapeHtml(shortWallet(payload.walletAddress))}</code>`,
-                "<i>No open positions</i>",
-                `Available <code>${escapeHtml(`${formatUsdCompact(Number(account.availableToSpendUsd || 0))} USD`)}</code>`,
-            ];
+        const onchainPositions = Array.isArray(overview.onchainPositions) ? overview.onchainPositions : [];
+        const lines = [
+            `Wallet <code>${escapeHtml(shortWallet(payload.walletAddress))}</code>`,
+            `Perp positions <code>${escapeHtml(positions.length)}</code>`,
+            `Spot holdings <code>${escapeHtml(onchainPositions.length)}</code>`,
+        ];
 
         if (positions.length) {
             lines.push("");
+            lines.push("<b>Pacifica</b>");
             positions.slice(0, 8).forEach((position: any, index: number) => {
                 lines.push(
                     `${index + 1}. <b>${escapeHtml(position.symbol)}</b> <i>${escapeHtml(position.side)}</i>`,
                     `<code>${escapeHtml(`amt ${formatNumberCompact(Number(position.amount || 0), 6)} | pnl ${formatUsdCompact(Number(position.unrealizedPnlUsd || 0))} USD`)}</code>`,
                 );
             });
+        } else {
+            lines.push("", "<i>No open Pacifica positions</i>");
+        }
+
+        if (onchainPositions.length) {
+            lines.push("", "<b>Onchain spot</b>");
+            onchainPositions.slice(0, 8).forEach((position: any, index: number) => {
+                lines.push(
+                    `${index + 1}. <b>${escapeHtml(position.symbol)}</b>`,
+                    `<code>${escapeHtml(`${formatNumberCompact(Number(position.quantity || 0), 6)} | ${formatUsdCompact(Number(position.valueUsd || 0))} USD`)}</code>`,
+                );
+            });
+        } else {
+            lines.push("", "<i>No open onchain positions</i>");
+            lines.push(`Available <code>${escapeHtml(`${formatUsdCompact(Number(account.availableToSpend || 0))} USD`)}</code>`);
         }
 
         const keyboard = positions.slice(0, 6).map((position: any) => ([
@@ -797,7 +922,11 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             summary ? `Available: <code>${escapeHtml(`${formatUsdCompact(summary.availableUsd)} USD`)}</code>` : null,
             summary ? `Withdrawable: <code>${escapeHtml(`${formatUsdCompact(summary.withdrawableUsd)} USD`)}</code>` : null,
             summary ? `Open positions: <code>${escapeHtml(summary.positionsCount)}</code>` : null,
+            summary ? `Spot holdings: <code>${escapeHtml(summary.onchainPositionsCount || 0)}</code>` : null,
             summary ? `PnL: <code>${escapeHtml(`${summary.totalPnlUsd >= 0 ? "+" : ""}${formatUsdCompact(summary.totalPnlUsd)} USD`)}</code>` : null,
+            summary && Number(summary.onchainValueUsd || 0) > 0
+                ? `Spot value: <code>${escapeHtml(`${formatUsdCompact(summary.onchainValueUsd)} USD`)}</code>`
+                : null,
             summary?.latestTrade
                 ? `Last trade: <code>${escapeHtml(`${summary.latestTrade.side} ${summary.latestTrade.symbol}${summary.latestTrade.orderId ? ` (${summary.latestTrade.orderId})` : ""}`)}</code>`
                 : "Last trade: <i>none</i>",
@@ -876,7 +1005,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             target.takeProfitPrice ? `<b>TP</b> <code>${escapeHtml(formatNumberCompact(Number(target.takeProfitPrice || 0), 6))}</code>` : null,
             target.stopLossPrice ? `<b>SL</b> <code>${escapeHtml(formatNumberCompact(Number(target.stopLossPrice || 0), 6))}</code>` : null,
             target.liquidationPrice ? `<b>Liq</b> <code>${escapeHtml(formatNumberCompact(Number(target.liquidationPrice || 0), 6))}</code>` : null,
-            `<i>Available</i> <code>${escapeHtml(`${formatUsdCompact(Number(account.availableToSpendUsd || 0))} USD`)}</code>`,
+            `<i>Available</i> <code>${escapeHtml(`${formatUsdCompact(Number(account.availableToSpend || 0))} USD`)}</code>`,
         ].filter(Boolean).join("\n"));
 
         const keyboard = [
@@ -917,7 +1046,8 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             const selectedPct = 10;
             const selectedLeverage = 1;
             const proposalData = prepared.proposal || {};
-            const draft = {
+            const draft: TelegramProposalDraft = {
+                kind: "pacifica",
                 chatId,
                 proposalId: Number(prepared.proposalId),
                 messageId: 0,
@@ -932,25 +1062,37 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             return;
         }
 
-        const proposalData = prepared.proposal || {};
-        const market = prepared.market || {};
-        const keyboard: Array<Array<TelegramInlineButton>> = [];
-        if (this.getConnectWebUrl())
-            keyboard.push([{ text: "Open Airifica", url: this.getConnectWebUrl() }]);
-        if (market.supportedOnJupiter && market.baseTokenAddress)
-            keyboard.push([{ text: "Open Jupiter", url: this.getJupiterUrl(market.baseTokenAddress) }]);
+        if (prepared.kind === "spot") {
+            const proposalData = prepared.proposal || {};
+            const market = prepared.market || {};
+            const draft: TelegramProposalDraft = {
+                kind: "spot",
+                chatId,
+                proposalId: Number(prepared.proposalId),
+                messageId: 0,
+                availableUsd: Number(prepared.availableUsd || 0),
+                maxLeverage: 1,
+                leverage: 1,
+                collateralPct: 25,
+                collateralUsd: null,
+                baseTokenAddress: market.baseTokenAddress || null,
+                marketQuery: market.requestQuery || market.baseTokenAddress || proposalData.symbol || null,
+                proposal: proposalData,
+            };
+            await this.replaceProposalCard(chatId, draft);
+            return;
+        }
 
+        const proposalData = prepared.proposal || {};
         await this.sendMessage(chatId, compact([
-            `$${proposalData.symbol || market.symbol || "TOKEN"} ${proposalData.timeframe || "1H"} | ${proposalData.side || "LONG"}`,
+            `$${proposalData.symbol || prepared.market?.symbol || "TOKEN"} ${proposalData.timeframe || "1H"} | ${proposalData.side || "LONG"}`,
             `Entry: ${formatNumberCompact(Number(proposalData.entry || 0), 6)}`,
             `TP: ${formatNumberCompact(Number(proposalData.tp || 0), 6)}`,
             `SL: ${formatNumberCompact(Number(proposalData.sl || 0), 6)}`,
             "",
-            market.supportedOnJupiter
-                ? "This setup is spot-routable on Jupiter. Open Airifica or Jupiter to execute it."
-                : "This market is informative only right now. Open Airifica for full context.",
+            "This market is informative only right now.",
         ].join("\n")), {
-            inlineKeyboard: keyboard.length ? keyboard : this.buildHomeKeyboard(true),
+            inlineKeyboard: this.buildHomeKeyboard(true),
         });
     }
 
@@ -1127,13 +1269,15 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                         body: JSON.stringify({ chatId }),
                     });
                     const proposal = snapshot.proposal?.data || {};
+                    const draftKind: "pacifica" | "spot" = snapshot.proposal?.executionVenue === "jupiter" ? "spot" : "pacifica";
                     const maxLeverage = Math.max(1, Number(snapshot.proposal?.maxLeverage || 1));
                     const existingDraft = this.proposalDrafts.get(this.getDraftKey(chatId, pendingInput.proposalId));
-                    const leverage = Math.max(1, Number(existingDraft?.leverage || 1));
+                    const leverage = draftKind === "spot" ? 1 : Math.max(1, Number(existingDraft?.leverage || 1));
                     const availableUsd = Number(snapshot.availableUsd || existingDraft?.availableUsd || 0);
-                    const collateralUsd = Math.min(availableUsd, numeric);
+                    const collateralUsd = draftKind === "spot" ? numeric : Math.min(availableUsd, numeric);
                     const messageId = Number(existingDraft?.messageId || 0);
                     const nextDraft = {
+                        kind: draftKind,
                         chatId,
                         proposalId: pendingInput.proposalId,
                         messageId,
@@ -1142,6 +1286,8 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                         leverage,
                         collateralPct: null,
                         collateralUsd,
+                        baseTokenAddress: snapshot.proposal?.baseTokenAddress || existingDraft?.baseTokenAddress || null,
+                        marketQuery: existingDraft?.marketQuery || snapshot.proposal?.baseTokenAddress || proposal.symbol || null,
                         proposal,
                     };
                     this.proposalDrafts.set(this.getDraftKey(chatId, pendingInput.proposalId), nextDraft);
@@ -1149,7 +1295,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
                     await this.replaceProposalCard(chatId, nextDraft);
 
-                    await this.sendMessage(chatId, `Collateral updated to ${formatUsdCompact(collateralUsd)} USD.`, {
+                    await this.sendMessage(chatId, `${draftKind === "spot" ? "Budget" : "Collateral"} updated to ${formatUsdCompact(collateralUsd)} USD.`, {
                         inlineKeyboard: [[
                             { text: "Back to proposal", callback_data: `tgp:r:${pendingInput.proposalId}` },
                         ]],
@@ -1157,7 +1303,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     return;
                 }
 
-                await this.sendMessage(chatId, "Expected a collateral amount in USD. Example: 12.5", {
+                await this.sendMessage(chatId, "Expected an amount in USD. Example: 12.5", {
                     inlineKeyboard: [[
                         { text: "Back to proposal", callback_data: `tgp:r:${pendingInput.proposalId}` },
                     ]],
@@ -1407,14 +1553,21 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     body: JSON.stringify({ chatId }),
                 });
                 const proposal = snapshot.proposal?.data || {};
+                const draftKind: "pacifica" | "spot" = snapshot.proposal?.executionVenue === "jupiter" ? "spot" : "pacifica";
                 const maxLeverage = Math.max(1, Number(snapshot.proposal?.maxLeverage || 1));
                 const existingDraft = this.proposalDrafts.get(draftKey);
                 const availableUsd = Number(snapshot.availableUsd || existingDraft?.availableUsd || 0);
-                let leverage = Math.min(maxLeverage, Math.max(1, Number(existingDraft?.leverage || firstRaw || 1)));
-                let collateralPct = existingDraft?.collateralPct ?? 10;
+                let leverage = draftKind === "spot"
+                    ? 1
+                    : Math.min(maxLeverage, Math.max(1, Number(existingDraft?.leverage || firstRaw || 1)));
+                let collateralPct = existingDraft?.collateralPct ?? (draftKind === "spot" ? 25 : 10);
                 let collateralUsd = existingDraft?.collateralUsd ?? null;
 
                 if (action === "x") {
+                    if (draftKind === "spot") {
+                        await this.answerCallbackQuery(callback.id, "Open in Airifica to sign the Jupiter swap");
+                        return;
+                    }
                     if (existingDraft?.collateralUsd != null) {
                         collateralUsd = Math.min(availableUsd, Math.max(0, Number(existingDraft.collateralUsd)));
                     } else {
@@ -1451,23 +1604,32 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
                 if (action === "s") {
                     this.pendingCollateralInputs.set(chatId, { proposalId });
-                    await this.answerCallbackQuery(callback.id, "Send the collateral amount in USD as your next message");
-                    await this.sendMessage(chatId, "Send the collateral amount in USD as your next message. Example: 12.5");
+                    await this.answerCallbackQuery(callback.id, draftKind === "spot"
+                        ? "Send the budget amount in USD as your next message"
+                        : "Send the collateral amount in USD as your next message");
+                    await this.sendMessage(chatId, draftKind === "spot"
+                        ? "Send the budget amount in USD as your next message. Example: 25"
+                        : "Send the collateral amount in USD as your next message. Example: 12.5");
                     return;
                 }
 
                 if (action === "p") {
-                    collateralPct = Math.min(100, Math.max(1, Number(firstRaw || 10)));
+                    collateralPct = Math.min(draftKind === "spot" ? 1000 : 100, Math.max(1, Number(firstRaw || (draftKind === "spot" ? 25 : 10))));
                     collateralUsd = null;
                 }
                 if (action === "l") {
+                    if (draftKind === "spot") {
+                        await this.answerCallbackQuery(callback.id, "Leverage is not available for spot swaps");
+                        return;
+                    }
                     leverage = Math.min(maxLeverage, Math.max(1, Number(firstRaw || 1)));
                 }
                 if (action === "r") {
-                    leverage = Math.min(maxLeverage, Math.max(1, Number(existingDraft?.leverage || 1)));
+                    leverage = draftKind === "spot" ? 1 : Math.min(maxLeverage, Math.max(1, Number(existingDraft?.leverage || 1)));
                 }
 
                 const nextDraft = {
+                    kind: draftKind,
                     chatId,
                     proposalId,
                     messageId: Number.isFinite(messageId) && messageId > 0 ? messageId : Number(existingDraft?.messageId || 0),
@@ -1476,6 +1638,8 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     leverage,
                     collateralPct,
                     collateralUsd,
+                    baseTokenAddress: snapshot.proposal?.baseTokenAddress || existingDraft?.baseTokenAddress || null,
+                    marketQuery: existingDraft?.marketQuery || snapshot.proposal?.baseTokenAddress || proposal.symbol || null,
                     proposal,
                 };
                 this.proposalDrafts.set(draftKey, nextDraft);
