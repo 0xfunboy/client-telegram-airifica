@@ -125,6 +125,7 @@ export class TelegramAirificaClient {
     private readonly proposalDrafts = new Map<string, TelegramProposalDraft>();
     private readonly pendingCollateralInputs = new Map<string, { proposalId: number }>();
     private readonly pendingActionInputs = new Map<string, PendingActionRequest>();
+    private heartbeatTimer: NodeJS.Timeout | null = null;
 
     constructor(runtime: IAgentRuntime) {
         this.runtime = runtime;
@@ -200,6 +201,43 @@ export class TelegramAirificaClient {
             throw error;
         }
         return payload as T;
+    }
+
+    private async trackEvent(chatId: string, category: "telegram_command" | "telegram_action" | "telegram_action_prompt", key: string) {
+        try {
+            await this.internalApi("/api/airi3/telegram/internal/analytics/event", {
+                method: "POST",
+                body: JSON.stringify({
+                    chatId,
+                    category,
+                    key,
+                }),
+            });
+        } catch (error) {
+            elizaLogger.warn(`[client-telegram-airifica] analytics event failed: ${describeError(error)}`);
+        }
+    }
+
+    private async sendRuntimeHeartbeat() {
+        await this.internalApi("/api/airi3/telegram/internal/runtime/heartbeat", {
+            method: "POST",
+            body: JSON.stringify({
+                botUsername: this.botUsername || null,
+                runtimeBaseUrl: this.runtimeBaseUrl,
+                pollTimeoutSeconds: this.pollTimeoutSeconds,
+                alertPollMs: this.alertPollMs,
+            }),
+        });
+    }
+
+    private async sendActionTrace(chatId: string, label: string) {
+        const text = String(label || "").trim();
+        if (!text)
+            return;
+
+        await this.sendMessage(chatId, `<i>User request ${escapeHtml(text)}</i>`, {
+            parseMode: "HTML",
+        });
     }
 
     private async sendMessage(chatId: string, text: string, options?: TelegramMessageOptions) {
@@ -552,6 +590,43 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         }
     }
 
+    private formatPendingActionTrace(pending: PendingActionRequest, input: string) {
+        const value = shortText(input, 48);
+        switch (pending.kind) {
+            case "chart":
+                return `Chart for ${value}`;
+            case "price":
+                return `Price for ${value}`;
+            case "analysis":
+                return `Analysis for ${value}`;
+            case "fundamentals":
+                return `Fundamentals for ${value}`;
+            case "news":
+                return `News for ${value}`;
+            case "sentiment":
+                return `Sentiment for ${value}`;
+            default:
+                return value;
+        }
+    }
+
+    private getDirectActionTrace(kind: string) {
+        switch (kind) {
+            case "trending":
+                return "Trending tokens";
+            case "listings":
+                return "New listings";
+            case "boosted":
+                return "Boosted tokens";
+            case "mentioned":
+                return "Most mentioned ticker";
+            case "volume":
+                return "Total market volume";
+            default:
+                return "";
+        }
+    }
+
     private async sendHome(chatId: string, messageId?: number) {
         let status: any = null;
         try {
@@ -884,6 +959,8 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
         if (!parsed)
             return false;
 
+        await this.trackEvent(chatId, "telegram_command", parsed.command);
+
         if (parsed.command === "start") {
             const payload = parsed.rawArgs.startsWith("link_") ? parsed.rawArgs.slice(5) : parsed.rawArgs;
             if (payload) {
@@ -1091,6 +1168,8 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             const pendingAction = this.pendingActionInputs.get(chatId);
             if (pendingAction) {
                 this.pendingActionInputs.delete(chatId);
+                await this.trackEvent(chatId, "telegram_action_prompt", pendingAction.kind);
+                await this.sendActionTrace(chatId, this.formatPendingActionTrace(pendingAction, text));
                 await this.handleConversationalMessage(chatId, `${pendingAction.promptPrefix} ${text}`);
                 return;
             }
@@ -1217,6 +1296,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
             if (data.startsWith("act:")) {
                 const kind = data.slice(4);
+                await this.trackEvent(chatId, "telegram_action", `act_${kind}`);
                 const pending = this.getPendingActionRequest(kind);
                 if (pending) {
                     this.pendingActionInputs.set(chatId, pending);
@@ -1253,6 +1333,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                                     : "";
                 if (directPrompt) {
                     await this.answerCallbackQuery(callback.id, "Running");
+                    await this.sendActionTrace(chatId, this.getDirectActionTrace(kind));
                     await this.handleConversationalMessage(chatId, directPrompt);
                     return;
                 }
@@ -1275,6 +1356,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
             if (data.startsWith("pos:")) {
                 const [, symbol, side] = data.split(":");
+                await this.trackEvent(chatId, "telegram_action", "position_detail");
                 await this.answerCallbackQuery(callback.id);
                 await this.renderPositionDetail(chatId, symbol, side, messageId);
                 return;
@@ -1282,6 +1364,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
             if (data.startsWith("pc:")) {
                 const [, symbol, side, pctRaw] = data.split(":");
+                await this.trackEvent(chatId, "telegram_action", `position_close_${pctRaw || "custom"}`);
                 const pct = Math.min(100, Math.max(1, Number(pctRaw || 100)));
                 const payload = await this.internalApi<any>("/api/airi3/telegram/internal/positions", {
                     method: "POST",
@@ -1311,6 +1394,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
             if (data.startsWith("tgp:")) {
                 const [, action, proposalIdRaw, firstRaw, secondRaw] = data.split(":");
+                await this.trackEvent(chatId, "telegram_action", `proposal_${action}`);
                 const proposalId = Number(proposalIdRaw);
                 if (!Number.isFinite(proposalId)) {
                     await this.answerCallbackQuery(callback.id, "Invalid proposal");
@@ -1520,6 +1604,16 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             elizaLogger.warn(`[client-telegram-airifica] setMyCommands skipped: ${describeError(error)}`);
         }
 
+        try {
+            await this.sendRuntimeHeartbeat();
+        } catch (error) {
+            elizaLogger.warn(`[client-telegram-airifica] heartbeat skipped: ${describeError(error)}`);
+        }
+        this.heartbeatTimer = setInterval(() => {
+            void this.sendRuntimeHeartbeat().catch((error) => {
+                elizaLogger.warn(`[client-telegram-airifica] heartbeat failed: ${describeError(error)}`);
+            });
+        }, 60_000);
         this.pollPromise = this.pollLoop();
         this.alertPromise = this.alertLoop();
         elizaLogger.success("[client-telegram-airifica] Telegram bot started");
@@ -1528,6 +1622,10 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
     public async stop(): Promise<void> {
         this.running = false;
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
         await Promise.allSettled([
             this.pollPromise,
             this.alertPromise,
