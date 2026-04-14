@@ -439,6 +439,25 @@ export class TelegramAirificaClient {
         return url.toString();
     }
 
+    private getAirificaSpotCloseUrl(input: {
+        marketQuery: string;
+        symbol: string;
+        mintAddress: string;
+        closePct: number;
+    }) {
+        if (!this.publicAppUrl)
+            return "";
+
+        const url = new URL(this.publicAppUrl);
+        url.searchParams.set("source", "telegram_bot");
+        url.searchParams.set("tgSpotClose", "1");
+        url.searchParams.set("query", String(input.marketQuery || input.symbol || input.mintAddress).trim());
+        url.searchParams.set("symbol", String(input.symbol || "").trim());
+        url.searchParams.set("mint", String(input.mintAddress || "").trim());
+        url.searchParams.set("closePct", String(Math.min(100, Math.max(1, Math.round(Number(input.closePct || 100))))));
+        return url.toString();
+    }
+
     private getDraftKey(chatId: string, proposalId: number) {
         return `${chatId}:${proposalId}`;
     }
@@ -497,6 +516,37 @@ export class TelegramAirificaClient {
             ],
             [{ text: "Refresh", callback_data: `tgp:r:${draft.proposalId}` }],
         ].filter(row => row.length > 0);
+    }
+
+    private buildSpotManagementKeyboard(input: {
+        symbol: string;
+        mintAddress: string;
+        marketQuery: string;
+    }) {
+        const openUrl = this.getAirificaSpotCloseUrl({
+            marketQuery: input.marketQuery,
+            symbol: input.symbol,
+            mintAddress: input.mintAddress,
+            closePct: 100,
+        });
+
+        const closeButtons = [25, 50, 100].map((value) => ({
+            text: value === 100 ? "Close market" : `Sell ${value}%`,
+            url: this.getAirificaSpotCloseUrl({
+                marketQuery: input.marketQuery,
+                symbol: input.symbol,
+                mintAddress: input.mintAddress,
+                closePct: value,
+            }),
+        }));
+
+        return [
+            closeButtons,
+            [
+                { text: "Open in Airifica", url: openUrl },
+                { text: "Positions", callback_data: "nav:positions" },
+            ],
+        ];
     }
 
     private buildProposalCardText(input: {
@@ -978,6 +1028,12 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 lines.push(
                     `${index + 1}. <b>${escapeHtml(position.symbol)}</b>`,
                     `<code>${escapeHtml(`${formatNumberCompact(Number(position.quantity || 0), 6)} | ${formatUsdCompact(Number(position.valueUsd || 0))} USD${pnlUsd == null ? "" : ` | pnl ${pnlUsd >= 0 ? "+" : ""}${formatUsdCompact(pnlUsd)} USD`}`)}</code>`,
+                    (Number(position.takeProfitPrice || 0) > 0 || Number(position.stopLossPrice || 0) > 0)
+                        ? `<i>${escapeHtml([
+                            Number(position.takeProfitPrice || 0) > 0 ? `TP ${formatNumberCompact(Number(position.takeProfitPrice || 0), 6)}` : null,
+                            Number(position.stopLossPrice || 0) > 0 ? `SL ${formatNumberCompact(Number(position.stopLossPrice || 0), 6)}` : null,
+                        ].filter(Boolean).join(" · "))}</i>`
+                        : null,
                 );
             });
         } else {
@@ -991,6 +1047,17 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 callback_data: `pos:${position.symbol}:${position.side}`,
             },
         ]));
+        onchainPositions.slice(0, 6).forEach((position: any) => {
+            const mintAddress = String(position.mintAddress || "").trim();
+            if (!mintAddress)
+                return;
+            keyboard.push([
+                {
+                    text: `${position.symbol} spot`,
+                    callback_data: `spot:${mintAddress}`,
+                },
+            ]);
+        });
 
         await this.sendPanelMessage(chatId, compact([
             "<b>Open positions</b>",
@@ -1006,6 +1073,53 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 ],
             ],
         }, messageId, !Number.isFinite(messageId));
+    }
+
+    private async renderSpotPositionDetail(chatId: string, mintAddress: string, messageId?: number) {
+        const payload = await this.internalApi<any>("/api/airi3/telegram/internal/positions", {
+            method: "POST",
+            body: JSON.stringify({ chatId }),
+        });
+        const overview = payload.overview || {};
+        const onchainPositions = Array.isArray(overview.onchainPositions) ? overview.onchainPositions : [];
+        const target = onchainPositions.find((position: any) => String(position.mintAddress || "").trim() === mintAddress);
+        if (!target) {
+            await this.sendOrEditMessage(chatId, messageId, "Spot holding no longer open.", {
+                inlineKeyboard: [[
+                    { text: "Positions", callback_data: "nav:positions" },
+                    { text: "Home", callback_data: "nav:home" },
+                ]],
+            });
+            return;
+        }
+
+        const symbol = String(target.symbol || "TOKEN");
+        const marketQuery = String(target.marketQuery || mintAddress || symbol).trim();
+        const text = compact([
+            `<b>${escapeHtml(symbol)} spot</b>`,
+            `<pre>Quantity      ${escapeHtml(formatNumberCompact(Number(target.quantity || 0), 6))}
+Value         ${escapeHtml(`${formatUsdCompact(Number(target.valueUsd || 0))} USD`)}
+PnL           ${escapeHtml(target.unrealizedPnlUsd == null ? "--" : `${Number(target.unrealizedPnlUsd || 0) >= 0 ? "+" : ""}${formatUsdCompact(Number(target.unrealizedPnlUsd || 0))} USD`)}</pre>`,
+            Number(target.takeProfitPrice || 0) > 0 ? `<b>TP</b> <code>${escapeHtml(formatNumberCompact(Number(target.takeProfitPrice || 0), 6))}</code>` : null,
+            Number(target.stopLossPrice || 0) > 0 ? `<b>SL</b> <code>${escapeHtml(formatNumberCompact(Number(target.stopLossPrice || 0), 6))}</code>` : null,
+            target.triggerOrderId ? `<i>Trigger</i> <code>${escapeHtml(String(target.triggerOrderId))}</code>` : null,
+        ].filter(Boolean).join("\n"));
+
+        await this.sendOrEditMessage(chatId, messageId, text, {
+            parseMode: "HTML",
+            inlineKeyboard: [
+                ...this.buildSpotManagementKeyboard({
+                    symbol,
+                    mintAddress,
+                    marketQuery,
+                }),
+                [
+                    { text: "Refresh", callback_data: `refresh:spot:${mintAddress}` },
+                    { text: "Positions", callback_data: "nav:positions" },
+                    { text: "Home", callback_data: "nav:home" },
+                ],
+            ],
+        });
     }
 
     private async renderStatus(chatId: string, messageId?: number) {
@@ -1108,6 +1222,10 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
     private buildSpotExecutionCompletedText(alert: any, draft: TelegramProposalDraft) {
         const symbol = String(alert?.meta?.symbol || draft.proposal?.symbol || "TOKEN").trim() || "TOKEN";
         const txSignature = String(alert?.meta?.txSignature || "").trim();
+        const tpPriceUsd = Number(alert?.meta?.tpPriceUsd || draft.proposal?.tp || 0);
+        const slPriceUsd = Number(alert?.meta?.slPriceUsd || draft.proposal?.sl || 0);
+        const triggerArmed = Boolean(alert?.meta?.triggerArmed);
+        const triggerOrderId = String(alert?.meta?.triggerOrderId || "").trim();
         const lines = [
             "<b>Spot trade opened</b>",
             "",
@@ -1116,10 +1234,38 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 ? `<i>Budget</i> <code>${escapeHtml(`${formatUsdCompact(Number(draft.collateralUsd || 0))} USD`)}</code>`
                 : null,
             txSignature ? `<i>Tx</i> <code>${escapeHtml(shortWallet(txSignature))}</code>` : null,
-            "<i>TP/SL levels remain analytical and were not placed onchain.</i>",
+            triggerArmed
+                ? `<i>Trigger</i> <code>${escapeHtml(triggerOrderId || "armed")}</code>`
+                : null,
+            Number.isFinite(tpPriceUsd) && tpPriceUsd > 0 ? `<i>TP</i> <code>${escapeHtml(formatNumberCompact(tpPriceUsd, 6))}</code>` : null,
+            Number.isFinite(slPriceUsd) && slPriceUsd > 0 ? `<i>SL</i> <code>${escapeHtml(formatNumberCompact(slPriceUsd, 6))}</code>` : null,
         ];
 
         return compact(lines.filter(Boolean).join("\n"));
+    }
+
+    private async sendSpotTradeAlert(chatId: string, alert: any) {
+        const symbol = String(alert?.meta?.symbol || "TOKEN").trim() || "TOKEN";
+        const mintAddress = String(alert?.meta?.positionMint || alert?.meta?.outputMint || "").trim();
+        const marketQuery = String(alert?.meta?.marketQuery || mintAddress || symbol).trim();
+        const keyboard = mintAddress
+            ? this.buildSpotManagementKeyboard({
+                symbol,
+                mintAddress,
+                marketQuery,
+            })
+            : [[{ text: "Home", callback_data: "nav:home" }]];
+
+        await this.sendMessage(chatId, String(alert.text || ""), {
+            inlineKeyboard: keyboard,
+        });
+    }
+
+    private isManagedSpotTradeAlert(alert: any) {
+        const kind = String(alert?.kind || alert?.meta?.kind || "TRADE_OPENED").trim().toUpperCase();
+        const venue = String(alert?.meta?.venue || "").trim();
+        const mintAddress = String(alert?.meta?.positionMint || alert?.meta?.outputMint || "").trim();
+        return kind === "TRADE_OPENED" && /jupiter/i.test(venue) && Boolean(mintAddress);
     }
 
     private async settleSpotProposalFromAlert(alert: any) {
@@ -1135,10 +1281,16 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
 
         await this.sendOrEditMessage(chatId, draft.messageId, this.buildSpotExecutionCompletedText(alert, draft), {
             parseMode: "HTML",
-            inlineKeyboard: [[
-                { text: "Positions", callback_data: "nav:positions" },
-                { text: "Home", callback_data: "nav:home" },
-            ]],
+            inlineKeyboard: String(alert?.meta?.positionMint || alert?.meta?.outputMint || "").trim()
+                ? this.buildSpotManagementKeyboard({
+                    symbol: String(alert?.meta?.symbol || draft.proposal?.symbol || "TOKEN"),
+                    mintAddress: String(alert?.meta?.positionMint || alert?.meta?.outputMint || "").trim(),
+                    marketQuery: String(alert?.meta?.marketQuery || draft.marketQuery || draft.baseTokenAddress || draft.proposal?.symbol || "").trim(),
+                })
+                : [[
+                    { text: "Positions", callback_data: "nav:positions" },
+                    { text: "Home", callback_data: "nav:home" },
+                ]],
         });
         this.proposalDrafts.delete(draftKey);
         this.pendingCollateralInputs.delete(chatId);
@@ -1650,6 +1802,21 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 return;
             }
 
+            if (data.startsWith("spot:")) {
+                const [, mintAddress] = data.split(":");
+                await this.trackEvent(chatId, "telegram_action", "spot_detail");
+                await this.answerCallbackQuery(callback.id);
+                await this.renderSpotPositionDetail(chatId, mintAddress, messageId);
+                return;
+            }
+
+            if (data.startsWith("refresh:spot:")) {
+                const [, , mintAddress] = data.split(":");
+                await this.answerCallbackQuery(callback.id);
+                await this.renderSpotPositionDetail(chatId, mintAddress, messageId);
+                return;
+            }
+
             if (data.startsWith("pc:")) {
                 const [, symbol, side, pctRaw] = data.split(":");
                 await this.trackEvent(chatId, "telegram_action", `position_close_${pctRaw || "custom"}`);
@@ -1865,7 +2032,9 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 for (const alert of alerts) {
                     try {
                         const handledInline = await this.settleSpotProposalFromAlert(alert);
-                        if (!handledInline)
+                        if (!handledInline && this.isManagedSpotTradeAlert(alert))
+                            await this.sendSpotTradeAlert(String(alert.chatId), alert);
+                        else if (!handledInline)
                             await this.sendMessage(String(alert.chatId), String(alert.text || ""));
                         await this.internalApi(`/api/airi3/telegram/internal/alerts/${alert.id}/delivered`, {
                             method: "POST",
