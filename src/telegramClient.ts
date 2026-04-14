@@ -99,16 +99,46 @@ function formatUsdCompact(value: number) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric))
         return "0.00";
-    return numeric.toFixed(Math.abs(numeric) >= 100 ? 2 : 4);
+    const absolute = Math.abs(numeric);
+    if (absolute >= 1_000_000) {
+        return new Intl.NumberFormat("en-US", {
+            notation: "compact",
+            maximumFractionDigits: 2,
+        }).format(numeric);
+    }
+    if (absolute >= 100)
+        return numeric.toFixed(2);
+    if (absolute >= 1)
+        return numeric.toFixed(2);
+    if (absolute === 0)
+        return "0.00";
+
+    const decimals = Math.min(8, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 1));
+    return numeric.toLocaleString("en-US", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: decimals,
+    });
 }
 
 function formatNumberCompact(value: number, decimals = 4) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric))
         return "0";
+    const absolute = Math.abs(numeric);
+    if (absolute >= 1_000_000) {
+        return new Intl.NumberFormat("en-US", {
+            notation: "compact",
+            maximumFractionDigits: 3,
+        }).format(numeric);
+    }
+    if (absolute === 0)
+        return "0";
+    const maxFractionDigits = absolute >= 1
+        ? Math.min(4, Math.max(0, decimals))
+        : Math.min(8, Math.max(2, Math.abs(Math.floor(Math.log10(absolute))) + 1));
     return numeric.toLocaleString("en-US", {
         minimumFractionDigits: 0,
-        maximumFractionDigits: decimals,
+        maximumFractionDigits: maxFractionDigits,
     });
 }
 
@@ -652,13 +682,13 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
                 { text: conversationalEnabled ? "Chat: on" : "Chat: off", callback_data: conversationalEnabled ? "chat:off" : "chat:on" },
             ]);
             keyboard.push([
-                { text: "Refresh", callback_data: "nav:home" },
+                { text: "Refresh", callback_data: "refresh:home" },
                 { text: "Unlink", callback_data: "nav:unlink" },
             ]);
         } else {
             keyboard.push([
                 { text: "Help", callback_data: "nav:help" },
-                { text: "Refresh", callback_data: "nav:home" },
+                { text: "Refresh", callback_data: "refresh:home" },
             ]);
         }
 
@@ -759,7 +789,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         }
     }
 
-    private async sendHome(chatId: string, messageId?: number) {
+    private async sendHome(chatId: string, messageId?: number, forceNew = true) {
         let status: any = null;
         try {
             status = await this.getLinkStatus(chatId);
@@ -801,7 +831,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ].join("\n")), {
             parseMode: "HTML",
             inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled), Boolean(link?.conversationalEnabled)),
-        }, messageId, true);
+        }, messageId, forceNew);
     }
 
     private async renderHelp(chatId: string, messageId?: number) {
@@ -871,9 +901,12 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         } else {
             history.slice(0, 10).forEach((item: any, index: number) => {
                 const venue = String(item.venue || "unknown").toUpperCase();
+                const pnlUsd = item.realizedPnlUsd != null
+                    ? Number(item.realizedPnlUsd || 0)
+                    : (item.currentPnlUsd != null ? Number(item.currentPnlUsd || 0) : null);
                 const rr = [
                     `${index + 1}. <b>${escapeHtml(item.symbol || "TOKEN")}</b> <i>${escapeHtml(item.side || "LONG")}</i>`,
-                    `<code>${escapeHtml(`${venue} · ${formatUsdCompact(Number(item.notionalUsd || 0))} USD${Number(item.leverage || 1) > 1 ? ` · ${Number(item.leverage || 1)}x` : ""}`)}</code>`,
+                    `<code>${escapeHtml(`${venue} · ${formatUsdCompact(Number(item.notionalUsd || 0))} USD${Number(item.leverage || 1) > 1 ? ` · ${Number(item.leverage || 1)}x` : ""}${pnlUsd == null ? "" : ` · pnl ${pnlUsd >= 0 ? "+" : ""}${formatUsdCompact(pnlUsd)} USD`}`)}</code>`,
                 ];
                 lines.push(...rr);
             });
@@ -885,11 +918,16 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             ...lines,
         ].join("\n")), {
             parseMode: "HTML",
-            inlineKeyboard: [[
-                { text: "Positions", callback_data: "nav:positions" },
-                { text: "Home", callback_data: "nav:home" },
-            ]],
-        }, messageId);
+            inlineKeyboard: [
+                [
+                    { text: "Refresh", callback_data: "refresh:history" },
+                ],
+                [
+                    { text: "Positions", callback_data: "nav:positions" },
+                    { text: "Home", callback_data: "nav:home" },
+                ],
+            ],
+        }, messageId, !Number.isFinite(messageId));
     }
 
     private parseCommand(text: string) {
@@ -936,9 +974,10 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         if (onchainPositions.length) {
             lines.push("", "<b>Onchain spot</b>");
             onchainPositions.slice(0, 8).forEach((position: any, index: number) => {
+                const pnlUsd = position.unrealizedPnlUsd == null ? null : Number(position.unrealizedPnlUsd || 0);
                 lines.push(
                     `${index + 1}. <b>${escapeHtml(position.symbol)}</b>`,
-                    `<code>${escapeHtml(`${formatNumberCompact(Number(position.quantity || 0), 6)} | ${formatUsdCompact(Number(position.valueUsd || 0))} USD`)}</code>`,
+                    `<code>${escapeHtml(`${formatNumberCompact(Number(position.quantity || 0), 6)} | ${formatUsdCompact(Number(position.valueUsd || 0))} USD${pnlUsd == null ? "" : ` | pnl ${pnlUsd >= 0 ? "+" : ""}${formatUsdCompact(pnlUsd)} USD`}`)}</code>`,
                 );
             });
         } else {
@@ -962,11 +1001,11 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             inlineKeyboard: [
                 ...keyboard,
                 [
-                    { text: "Refresh positions", callback_data: "nav:positions" },
+                    { text: "Refresh positions", callback_data: "refresh:positions" },
                     { text: "Home", callback_data: "nav:home" },
                 ],
             ],
-        }, messageId);
+        }, messageId, !Number.isFinite(messageId));
     }
 
     private async renderStatus(chatId: string, messageId?: number) {
@@ -1046,7 +1085,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                 { text: "Close 100%", callback_data: `pc:${symbol}:${side}:100` },
             ],
             [
-                { text: "Refresh", callback_data: `pos:${symbol}:${side}` },
+                { text: "Refresh", callback_data: `refresh:position:${symbol}:${side}` },
                 { text: "Positions", callback_data: "nav:positions" },
                 { text: "Home", callback_data: "nav:home" },
             ],
@@ -1446,25 +1485,50 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
         try {
             if (data === "nav:home") {
                 await this.answerCallbackQuery(callback.id);
-                await this.sendHome(chatId, messageId);
+                await this.sendHome(chatId);
                 return;
             }
 
             if (data === "nav:positions") {
                 await this.answerCallbackQuery(callback.id);
-                await this.renderPositions(chatId, messageId);
+                await this.renderPositions(chatId);
                 return;
             }
 
             if (data === "nav:history") {
                 await this.answerCallbackQuery(callback.id);
-                await this.renderHistory(chatId, messageId);
+                await this.renderHistory(chatId);
                 return;
             }
 
             if (data === "nav:status") {
                 await this.answerCallbackQuery(callback.id);
-                await this.renderStatus(chatId, messageId);
+                await this.renderStatus(chatId);
+                return;
+            }
+
+            if (data === "refresh:home") {
+                await this.answerCallbackQuery(callback.id);
+                await this.sendHome(chatId, messageId, false);
+                return;
+            }
+
+            if (data === "refresh:positions") {
+                await this.answerCallbackQuery(callback.id);
+                await this.renderPositions(chatId, messageId);
+                return;
+            }
+
+            if (data === "refresh:history") {
+                await this.answerCallbackQuery(callback.id);
+                await this.renderHistory(chatId, messageId);
+                return;
+            }
+
+            if (data.startsWith("refresh:position:")) {
+                const [, , , symbol, side] = data.split(":");
+                await this.answerCallbackQuery(callback.id);
+                await this.renderPositionDetail(chatId, symbol, side, messageId);
                 return;
             }
 
@@ -1486,7 +1550,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     body: JSON.stringify({ chatId }),
                 });
                 await this.answerCallbackQuery(callback.id, "Telegram unlinked");
-                await this.sendHome(chatId, messageId);
+                await this.sendHome(chatId);
                 return;
             }
 
@@ -1497,7 +1561,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     body: JSON.stringify({ chatId, enabled }),
                 });
                 await this.answerCallbackQuery(callback.id, enabled ? "Alerts enabled" : "Alerts disabled");
-                await this.sendHome(chatId, messageId);
+                await this.sendHome(chatId, messageId, false);
                 return;
             }
 
@@ -1514,7 +1578,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
                     body: JSON.stringify({ chatId, enabled }),
                 });
                 await this.answerCallbackQuery(callback.id, enabled ? "Conversation enabled" : "Conversation disabled");
-                await this.sendHome(chatId, messageId);
+                await this.sendHome(chatId, messageId, false);
                 return;
             }
 
