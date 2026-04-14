@@ -336,8 +336,9 @@ export class TelegramAirificaClient {
         return Number.isFinite(stored) && Number(stored) > 0 ? Number(stored) : undefined;
     }
 
-    private async sendPanelMessage(chatId: string, text: string, options?: TelegramMessageOptions, messageId?: number) {
-        const nextMessageId = await this.sendOrEditMessage(chatId, this.resolvePanelMessageId(chatId, messageId), text, options);
+    private async sendPanelMessage(chatId: string, text: string, options?: TelegramMessageOptions, messageId?: number, forceNew = false) {
+        const targetMessageId = forceNew ? undefined : this.resolvePanelMessageId(chatId, messageId);
+        const nextMessageId = await this.sendOrEditMessage(chatId, targetMessageId, text, options);
         if (Number.isFinite(nextMessageId) && Number(nextMessageId) > 0)
             this.panelMessageIds.set(chatId, Number(nextMessageId));
         return nextMessageId;
@@ -643,6 +644,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
             keyboard.push([
                 { text: "Actions", callback_data: "nav:actions" },
                 { text: "Positions", callback_data: "nav:positions" },
+                { text: "History", callback_data: "nav:history" },
                 { text: "Help", callback_data: "nav:help" },
             ]);
             keyboard.push([
@@ -666,7 +668,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
     private buildHelpKeyboard(linked: boolean) {
         return [
             [
-                ...(linked ? [{ text: "Actions", callback_data: "nav:actions" }, { text: "Positions", callback_data: "nav:positions" }] : []),
+                ...(linked ? [{ text: "Actions", callback_data: "nav:actions" }, { text: "Positions", callback_data: "nav:positions" }, { text: "History", callback_data: "nav:history" }] : []),
                 { text: "Home", callback_data: "nav:home" },
             ],
         ];
@@ -799,7 +801,7 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ].join("\n")), {
             parseMode: "HTML",
             inlineKeyboard: this.buildHomeKeyboard(linked, Boolean(link?.alertsEnabled), Boolean(link?.conversationalEnabled)),
-        }, messageId);
+        }, messageId, true);
     }
 
     private async renderHelp(chatId: string, messageId?: number) {
@@ -848,6 +850,45 @@ Stop loss     ${escapeHtml(formatNumberCompact(input.sl, 6))}</pre>`,
         ].join("\n")), {
             parseMode: "HTML",
             inlineKeyboard: this.buildActionsKeyboard(),
+        }, messageId);
+    }
+
+    private async renderHistory(chatId: string, messageId?: number) {
+        const payload = await this.internalApi<any>("/api/airi3/telegram/internal/history", {
+            method: "POST",
+            body: JSON.stringify({ chatId }),
+        });
+        const history = Array.isArray(payload.history) ? payload.history : [];
+        const summary = payload.summary || null;
+        const lines = [
+            summary ? `PnL <code>${escapeHtml(`${Number(summary.totalPnlUsd || 0) >= 0 ? "+" : ""}${formatUsdCompact(Number(summary.totalPnlUsd || 0))} USD`)}</code>` : null,
+            summary ? `Spot holdings <code>${escapeHtml(summary.onchainPositionsCount || 0)}</code>` : null,
+            "",
+        ].filter(Boolean) as string[];
+
+        if (!history.length) {
+            lines.push("<i>No trade history recorded yet.</i>");
+        } else {
+            history.slice(0, 10).forEach((item: any, index: number) => {
+                const venue = String(item.venue || "unknown").toUpperCase();
+                const rr = [
+                    `${index + 1}. <b>${escapeHtml(item.symbol || "TOKEN")}</b> <i>${escapeHtml(item.side || "LONG")}</i>`,
+                    `<code>${escapeHtml(`${venue} · ${formatUsdCompact(Number(item.notionalUsd || 0))} USD${Number(item.leverage || 1) > 1 ? ` · ${Number(item.leverage || 1)}x` : ""}`)}</code>`,
+                ];
+                lines.push(...rr);
+            });
+        }
+
+        await this.sendPanelMessage(chatId, compact([
+            "<b>History</b>",
+            "",
+            ...lines,
+        ].join("\n")), {
+            parseMode: "HTML",
+            inlineKeyboard: [[
+                { text: "Positions", callback_data: "nav:positions" },
+                { text: "Home", callback_data: "nav:home" },
+            ]],
         }, messageId);
     }
 
@@ -1244,6 +1285,11 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             return true;
         }
 
+        if (parsed.command === "history") {
+            await this.renderHistory(chatId);
+            return true;
+        }
+
         if (parsed.command === "close") {
             const symbol = parsed.args[0]?.toUpperCase();
             const side = parsed.args[1]?.toUpperCase();
@@ -1407,6 +1453,12 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             if (data === "nav:positions") {
                 await this.answerCallbackQuery(callback.id);
                 await this.renderPositions(chatId, messageId);
+                return;
+            }
+
+            if (data === "nav:history") {
+                await this.answerCallbackQuery(callback.id);
+                await this.renderHistory(chatId, messageId);
                 return;
             }
 
@@ -1786,6 +1838,7 @@ Margin        ${escapeHtml(`${formatUsdCompact(Number(target.margin || 0))} USD`
             await this.setCommands([
                 { command: "start", description: "Open the Airifica Telegram home" },
                 { command: "positions", description: "View open Pacifica positions" },
+                { command: "history", description: "View recent executed trades" },
                 { command: "status", description: "Show linked wallet and bot status" },
                 { command: "account", description: "Show account funds, PnL and last trade" },
                 { command: "alerts", description: "Toggle Telegram alerts on or off" },
