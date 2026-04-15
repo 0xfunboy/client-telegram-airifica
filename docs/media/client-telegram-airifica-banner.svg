@@ -1,0 +1,20 @@
+<svg width="1600" height="420" viewBox="0 0 1600 420" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1600" y2="420" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#06111D"/>
+      <stop offset="1" stop-color="#12304A"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="320" y1="90" x2="1400" y2="320" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#229ED9" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#4ADE80" stop-opacity="0.16"/>
+    </linearGradient>
+  </defs>
+  <rect width="1600" height="420" rx="28" fill="url(#bg)"/>
+  <rect x="40" y="40" width="1520" height="340" rx="24" fill="url(#accent)" stroke="rgba(100,200,255,0.16)"/>
+  <circle cx="1310" cy="126" r="82" fill="#229ED9" fill-opacity="0.14"/>
+  <circle cx="1435" cy="276" r="116" fill="#4ADE80" fill-opacity="0.10"/>
+  <path d="M152 108C110 108 76 142 76 184C76 226 110 260 152 260C194 260 228 226 228 184C228 142 194 108 152 108ZM186 159L167 214C165 220 161 221 156 218L133 201L122 212C121 214 119 215 116 215L120 191L163 152C165 150 162 149 159 151L106 184L83 176C78 174 78 170 84 168L173 133C177 131 181 134 180 141L186 159Z" fill="#F8FAFC"/>
+  <text x="340" y="170" fill="#F8FAFC" font-family="Arial, Helvetica, sans-serif" font-size="68" font-weight="700">client-telegram-airifica</text>
+  <text x="342" y="228" fill="#A7C2D6" font-family="Arial, Helvetica, sans-serif" font-size="28">Telegram-native control surface for linking, alerts, proposals, positions, and account workflows</text>
+  <text x="342" y="292" fill="#DDF7FF" font-family="Arial, Helvetica, sans-serif" font-size="24">Deep links • Runtime heartbeat • Guided action menus • Pacifica and Jupiter-aware notifications</text>
+</svg>
