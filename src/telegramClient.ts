@@ -180,11 +180,15 @@ export class TelegramAirificaClient {
             runtime.getSetting("AIRIFICA_TELEGRAM_RUNTIME_BASE_URL")
             || envValue("TELEGRAM_RUNTIME_BASE_URL", `http://127.0.0.1:${port}`)
         ).replace(/\/+$/, "");
-        this.internalSecret = String(
+        const resolvedInternalSecret = String(
             runtime.getSetting("AIRIFICA_TELEGRAM_INTERNAL_SECRET")
             || envValue("TELEGRAM_INTERNAL_SECRET")
-            || this.botToken
+            || "",
         ).trim();
+        if (!resolvedInternalSecret) {
+            console.warn("[client-telegram-airifica] AIRIFICA_TELEGRAM_INTERNAL_SECRET is not set. Internal Telegram API endpoints will return 503 until it is configured.");
+        }
+        this.internalSecret = resolvedInternalSecret;
         this.pollTimeoutSeconds = Math.max(10, Number(envValue("TELEGRAM_POLL_TIMEOUT_SECONDS", "50")));
         this.alertPollMs = Math.max(2000, Number(envValue("TELEGRAM_ALERT_POLL_MS", "5000")));
         this.publicAppUrl = String(
@@ -203,6 +207,11 @@ export class TelegramAirificaClient {
 
     private get apiBase() {
         return `https://api.telegram.org/bot${this.botToken}`;
+    }
+
+    private get apiBaseSafe() {
+        const suffix = this.botToken ? `***${this.botToken.slice(-4)}` : "(unset)";
+        return `https://api.telegram.org/bot${suffix}`;
     }
 
     private async telegramApi<T>(method: string, payload: Record<string, unknown>) {
