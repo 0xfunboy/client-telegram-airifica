@@ -1,16 +1,16 @@
 {
-    "name": "@elizaos/client-telegram-airifica",
-    "version": "0.25.6-alpha.1",
+    "name": "client-telegram-airifica",
+    "version": "0.1.0",
+    "description": "Telegram control surface and alert client for Airifica runtimes.",
+    "license": "MIT",
     "type": "module",
     "main": "dist/index.js",
     "module": "dist/index.js",
-    "types": "dist/index.d.ts",
     "exports": {
         "./package.json": "./package.json",
         ".": {
             "import": {
                 "@elizaos/source": "./src/index.ts",
-                "types": "./dist/index.d.ts",
                 "default": "./dist/index.js"
             }
         }
@@ -19,15 +19,32 @@
         "dist"
     ],
     "dependencies": {
-        "@elizaos/core": "workspace:*"
+        "@elizaos/core": "0.25.6-alpha.1"
     },
     "devDependencies": {
-        "tsup": "8.3.5"
+        "@types/node": "^22.8.4",
+        "tsup": "8.3.5",
+        "typescript": "5.6.3"
     },
     "scripts": {
-        "build": "tsup --format esm --dts",
-        "dev": "tsup --format esm --dts --watch"
+        "build": "tsup --format esm",
+        "dev": "tsup --format esm --watch"
     },
+    "keywords": [
+        "airifica",
+        "telegram",
+        "bot",
+        "alerts",
+        "solana"
+    ],
+    "repository": {
+        "type": "git",
+        "url": "git@github.com:0xfunboy/client-telegram-airifica.git"
+    },
+    "bugs": {
+        "url": "https://github.com/0xfunboy/client-telegram-airifica/issues"
+    },
+    "homepage": "https://github.com/0xfunboy/client-telegram-airifica#readme",
     "publishConfig": {
         "access": "public"
     }
