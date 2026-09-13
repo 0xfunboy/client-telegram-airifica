@@ -125,4 +125,4 @@ The Telegram client expects these internal capabilities from `client-airifica`:
 
 ## License
 
-MIT
+Existing MIT permissions are preserved. See [LICENSING.md](LICENSING.md) for the terms applying to eligible original material.
